@@ -556,8 +556,8 @@ export function startTranslating(): void {
 /** The tab's title with this edition's name, and "Untitled" in Italian. */
 function retitle(): void {
   const t = document.title;
-  let next = t.replace(/Sawhorse/g, "3Dschool");
-  if (current === "it") next = next.replace(/^Untitled/, "Senza titolo");
+  let next = t.replace(/\bSawhorse\b/g, "3Dschool");
+  if (current === "it") next = next.replace(/^Untitled\b/, "Senza titolo");
   if (next !== t) document.title = next;
 }
 
