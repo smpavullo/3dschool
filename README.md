@@ -20,8 +20,9 @@ Sito: <https://smpavullo.github.io/3dschool/>
 - **Finestra Informazioni** con chi ha adattato il programma e da dove viene.
 - **Plugin "Laboratorio"**, già attivo, per le lezioni di tecnologia (ispirato a WoodSketch):
   *Progetti guidati* (scatola, casetta per uccelli, sgabello, tavolino, panca, cassetto, cassetta degli
-  attrezzi, mensola, libreria), *Giunzioni* (scasso, battuta, mezzo legno, incastro a dita, foro),
-  *Profili dei bordi* (smusso, arrotondamento, cavetto) e *Fogli di montaggio*
+  attrezzi, mensola, libreria), *Giunzioni* (scasso, battuta, mezzo legno, incastro a dita, foro,
+  tenone e mortasa, maschio e femmina, coda di rondine), *Profili dei bordi* (smusso, bisello,
+  arrotondamento, cavetto, battuta, scanalatura, gola romana, toro) e *Fogli di montaggio*
   (PDF con l'elenco dei pezzi, i passi e le tre viste in scala).
 
 ## Come funziona e cosa si salva

@@ -3,8 +3,8 @@
 // pensato per le lezioni di tecnologia. Ispirato a WoodSketch (https://github.com/FMastro/woodsketch),
 // riscritto qui per il sistema dei plugin.
 import { file, model, storage, ui, units } from "sawhorse";
-import { PROFILES, edgePlan } from "./lib/edges.js";
-import { JOINT_DEFAULTS, KINDS, faceInfo, plan } from "./lib/joints.js";
+import { PROFILES, edgePlan, profileName } from "./lib/edges.js";
+import { JOINT_DEFAULTS, JOINT_LABELS, KINDS, faceInfo, plan } from "./lib/joints.js";
 import { assemblySheets } from "./lib/sheets.js";
 import { MATERIALS, PROJECTS, defaultsOf, projectById } from "./lib/projects.js";
 
@@ -142,19 +142,12 @@ const joint = { kind: "scasso", ...JOINT_DEFAULTS.scasso };
 
 /** @returns {import("sawhorse").Field[]} */
 function jointBody() {
-  const labels = /** @type {Record<string, [string, string | null]>} */ ({
-    scasso: ["Larghezza", "Profondità (0 = passante)"],
-    battuta: ["Larghezza", "Profondità (0 = passante)"],
-    mezzolegno: ["Lunghezza della sovrapposizione", null],
-    dita: ["Larghezza di un dito", "Lunghezza delle dita (0 = spessore)"],
-    foro: ["Diametro", "Profondità (0 = passante)"],
-  });
-  const [wl, dl] = labels[joint.kind] ?? labels.scasso;
+  const { width: wl, depth: dl, where } = JOINT_LABELS[joint.kind] ?? JOINT_LABELS.scasso;
   return [
     { type: "select", id: "tipo", label: "Giunzione", value: joint.kind, options: KINDS.map((k) => ({ value: k.value, label: k.label })) },
     { type: "number", id: "larghezza", label: wl, unit: "length", value: joint.width, min: 0 },
     ...(dl ? [/** @type {import("sawhorse").Field} */ ({ type: "number", id: "profondita", label: dl, unit: "length", value: joint.depth, min: 0 })] : []),
-    { type: "note", id: "come", text: "1. Fai doppio clic sul pezzo per aprirlo. 2. Attiva lo strumento. 3. Clicca sulla faccia, nel punto dove vuoi il taglio (per la battuta, vicino al bordo).", tone: "info" },
+    { type: "note", id: "come", text: `1. Fai doppio clic sul pezzo per aprirlo. 2. Attiva lo strumento. 3. ${where}`, tone: "info" },
     { type: "button", id: "attiva", label: "Attiva lo strumento Giunzione", primary: true },
   ];
 }
@@ -231,10 +224,11 @@ await ui.registerTool({
       return;
     }
     const batch = model.batch(`Giunzione: ${made.note}`);
-    for (const points of made.cuts) {
-      const drawn = batch.op({ op: "draw", target: { on: "face", object: data.info.solid, face: data.info.face }, points, closed: true, ...(made.centre ? { curve: { kind: "circle", centre: made.centre } } : {}) });
-      batch.op({ op: "push_pull", object: data.info.solid, face: drawn.face, distance: -made.depth });
-    }
+    // Prima tutte le sagome, poi tutte le spinte: finché niente è spinto la faccia cliccata resta sul suo
+    // piano, qualunque dei pezzi in cui le sagome la dividono ne tenga il numero.
+    const { solid, face } = data.info;
+    const drawn = made.cuts.map((points) => batch.op({ op: "draw", target: { on: "face", object: solid, face }, points, closed: true, ...(made.centre ? { curve: { kind: "circle", centre: made.centre } } : {}) }));
+    for (const d of drawn) batch.op({ op: "push_pull", object: solid, face: d.face, distance: -made.depth });
     try {
       await batch.commit();
       faceCache = null;
@@ -282,7 +276,7 @@ async function applyProfile() {
     await ui.notify("Seleziona prima uno o più spigoli del pezzo (clicca sullo spigolo con lo strumento Seleziona).", { kind: "warning" });
     return;
   }
-  const batch = model.batch(`Profilo: ${profile.kind}`);
+  const batch = model.batch(`Profilo: ${profileName(profile.kind)}`);
   let count = 0;
   for (const it of edges.slice(0, 12)) {
     if (it.kind !== "edge") continue;
@@ -293,7 +287,7 @@ async function applyProfile() {
       return;
     }
     const faces = await model.faces(it.owner.id);
-    const made = edgePlan(/** @type {"smusso" | "arrotondato" | "cavetto"} */ (profile.kind), profile.size, { a: it.a, b: it.b }, { min: solid.min, max: solid.max }, faces);
+    const made = edgePlan(/** @type {import("./lib/edges.js").Profile} */ (profile.kind), profile.size, { a: it.a, b: it.b }, { min: solid.min, max: solid.max }, faces);
     if (typeof made === "string") {
       await ui.notify(made, { kind: "warning" });
       return;
@@ -304,7 +298,7 @@ async function applyProfile() {
   }
   try {
     await batch.commit();
-    await edgePanel.update({ fields: { esito: { text: `Fatto: ${profile.kind} su ${count} ${count === 1 ? "spigolo" : "spigoli"}.`, tone: "info" } } });
+    await edgePanel.update({ fields: { esito: { text: `Fatto: ${profileName(profile.kind)} su ${count} ${count === 1 ? "spigolo" : "spigoli"}.`, tone: "info" } } });
   } catch (e) {
     await ui.notify(`Non sono riuscito a fare il profilo: ${e instanceof Error ? e.message : String(e)}`, { kind: "error" });
   }
