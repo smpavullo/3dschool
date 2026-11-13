@@ -8,11 +8,11 @@
 //!
 //! | Format | Reader | Units | Becomes |
 //! |---|---|---|---|
-//! | STL (binary and ASCII) | [`stl`] | none in the file: millimetres unless told otherwise | one item per `solid` block, coplanar triangles merged |
-//! | Wavefront OBJ | [`obj`] | none: millimetres unless told otherwise | one item per `o` (or `g`); `l` lines kept |
+//! | STL (binary and ASCII) | [`stl`] | Sawhorse's own binary STL (its header, exactly): millimetres (#47); any other says nothing: [`ImportOptions::units`] (File > Import units), millimetres when unset | one item per `solid` block, coplanar triangles merged |
+//! | Wavefront OBJ | [`obj`] | Sawhorse's own OBJ (its first line, after any byte order mark): millimetres (#47); any other says nothing: [`ImportOptions::units`] (File > Import units), millimetres when unset | one item per `o` (or `g`); `l` lines kept |
 //! | glTF 2.0 / GLB | [`gltf`] | metres, Y up | one item per node with a mesh, transforms applied; `_FACE_ID` honoured |
 //! | 3MF | [`three_mf`] | the file's `unit` | one item per build item (components resolved), base-material colours |
-//! | DXF (ASCII) | [`dxf`] | `$INSUNITS` (millimetres when unset) | `3DFACE` and polyface meshes as items per layer; `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC` as sketch strokes |
+//! | DXF (ASCII) | [`dxf`] | `$INSUNITS` (inches, feet, millimetres, centimetres or metres); when it is missing, 0 or another code, [`ImportOptions::units`] (File > Import units), millimetres when unset | `3DFACE` and polyface meshes as items per layer; `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC` as sketch strokes |
 //! | SVG | [`svg`] | the root's `width`/`height` + `viewBox` (CSS px when unitless) | every path and shape as strokes on the ground plane |
 //!
 //! `.skp` is read in the webview by the npm `openskp` package (`src/io/skp.ts`), which
@@ -374,6 +374,40 @@ pub(crate) mod test_support {
         })
         .unwrap();
         d
+    }
+
+    /// One 48 x 3 1/2 x 1 1/2 in board: the base rail of #47's bench frame.
+    pub fn rail_48in() -> Document {
+        const IN: f64 = 0.0254;
+        let mut d = Document::with_ground_sketch();
+        d.apply(
+            &serde_json::from_str(&format!(
+                r#"{{"op":"add_rectangle","sketch":1,"x":0,"y":0,"w":{},"h":{}}}"#,
+                48.0 * IN,
+                3.5 * IN
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        d.apply(
+            &serde_json::from_str(&format!(
+                r#"{{"op":"extrude","sketch":1,"region":1,"distance":{}}}"#,
+                1.5 * IN
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        d
+    }
+
+    /// The longest extent along x of everything the reader found, in metres.
+    pub fn x_extent(p: &crate::Parsed) -> f64 {
+        let xs = || {
+            p.items
+                .iter()
+                .flat_map(|i| i.positions.iter().map(|q| q[0]))
+        };
+        xs().fold(f64::MIN, f64::max) - xs().fold(f64::MAX, f64::min)
     }
 }
 

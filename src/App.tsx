@@ -25,16 +25,17 @@ import { ValueBar, type StatusMessage } from "./components/ValueBar";
 import { createKernel, KernelUnavailableError, type EditResult, type EmptySkp, type KernelClient, type RestartInfo } from "./kernel/client";
 import { useRenderGate } from "./credits/gate";
 import { SettingsDialog } from "./components/SettingsDialog";
-import type { Entity, KernelOp, SceneData, V3 } from "./kernel/types";
+import type { DocState, Entity, KernelOp, MeshData, SceneData, V3 } from "./kernel/types";
 import { describeTarget, nextTarget, type Target } from "./lib/edit";
 import { entityKey, eraseOps, partsOf, selectionHighlight, selectionLookup, withHover } from "./lib/entities";
 import { thumbnailUrl } from "./lib/thumbnail";
 import { contextTrail, describeNode, entityShown, graphIndex, graphOf, nodeById, objectParent, quoted, scopeEntity, solidsIn } from "./lib/scope";
 import { meshIndex } from "./lib/meshIndex";
+import { isMac, quitLabel } from "./lib/platform";
 import { describe } from "./tools/select";
 import type { OverlayItem } from "./viewport/engine";
 import { startsValueEntry, toolById, toolForKey, type ToolId } from "./lib/tools";
-import { formatLength, M_PER_IN, UNIT_CHOICES, unitInfo, UNIT_SYSTEMS, type UnitSystem } from "./lib/units";
+import { formatLength, formatVolume, M_PER_IN, UNIT_CHOICES, unitInfo, UNIT_SYSTEMS, type UnitSystem } from "./lib/units";
 import type { Projection, ViewId, ViewportEngine } from "./viewport/engine";
 import { gridSpec, projectionForView, VIEWS } from "./viewport/camera";
 import { EMPTY_VIEW, type Tool, type ToolHost, type ToolView } from "./tools/tool";
@@ -56,7 +57,10 @@ import { InferenceMemory, kernelResolver, ToolDriver } from "./tools/driver";
 import { friendlyError, setNameSource } from "./lib/names";
 import { explodeOps } from "./lib/curves";
 import { autosaveEnabled, clearAutosave, clearOffered, describeAutosave, loadOffered, logIsWorth, MAX_AUTOSAVE_BYTES, saveAutosave, takeAutosave, worthRestoring, type Autosave } from "./lib/autosave";
-import { ALL_EXTENSIONS, IMPORT_TYPES, SHZ, extensionOf, onTauriDrop, pickFile, readBrowserFile, saveFile, stem, type FileHandle, type PickedFile } from "./io/files";
+import { ALL_EXTENSIONS, askYesNo, extensionOf, IMPORT_TYPES, isTauri, onTauriDrop, pickFile, readBrowserFile, saveFile, SHZ, stem, takeTauriPaths, type FileHandle, type PickedFile } from "./io/files";
+import { closeHandler, desktopShell, discardQuestion } from "./io/closing";
+import { notOpenedNote, openLabel, startupOrder, takeStartupFile, waitingNote } from "./io/startup";
+import { showTitle } from "./io/title";
 import { EXPORTS, MTL_TYPE, textureType, type ExportChoice } from "./io/exports";
 import type { ExportOptions, ImportUnit, OpOutcome } from "./kernel/types";
 import { ImportReport, type Report } from "./components/ImportReport";
@@ -82,6 +86,7 @@ import { pickFile as pickAnyFile } from "./io/files";
 import type { AppBridge } from "./plugins/manager";
 // Lane 12: section planes.
 import { SectionTool } from "./tools/section";
+import { isNavTool, leftButtonNav, OrbitTool, PanTool } from "./tools/navigate";
 import { activeSectionHere, describeSection, sceneSectionsOf, sectionById, sliceExportRefused } from "./lib/sections";
 
 /** The solids, groups and components a selection stands for (a face or edge stands for its
@@ -285,6 +290,29 @@ function partNames(rows: CutRow[]): string {
 
 type Message = StatusMessage | null;
 
+/** Lane 43 (#7): a document state as undo and redo find it again: its undo depth and model
+ * hash (as the named plugin steps are known). */
+function stepKey(st: DocState | null | undefined): string {
+  return st ? `${st.undo_depth}:${st.stats.hash}` : "";
+}
+
+/** Lane 43 (#7): a selection and Push/Pull target to keep through an undo or a redo. */
+interface KeptSelection {
+  selection: Entity[];
+  target: Target | null;
+}
+
+/** Lane 43 (#7): what a tool left selected after a step and what was selected before it,
+ * between the states the step went `from` and `to`. */
+interface RememberedStep {
+  from: string;
+  to: string;
+  before: Entity[];
+  beforeTarget: Target | null;
+  after: Entity[];
+  afterTarget: Target | null;
+}
+
 export function App() {
   const [toolId, setToolId] = useState<ToolId>("select");
   const tool = toolById(toolId);
@@ -303,6 +331,11 @@ export function App() {
   const [selection, setSelection] = useState<Entity[]>([]);
   const [hover, setHover] = useState<Entity | null>(null);
   const [target, setTarget] = useState<Target | null>(null);
+  /** Lane 43 (#7): where the last op that landed went from and to ({@link stepKey}), and
+   * Push/Pull's target before it, for the tool host's rememberSelection. */
+  const lastStep = useRef<{ from: string; to: string; target: Target | null } | null>(null);
+  /** Lane 43 (#7): the selections tools remembered around their steps, newest last, at most 200. */
+  const stepSelections = useRef<RememberedStep[]>([]);
   const [toolView, setToolView] = useState<ToolView>(EMPTY_VIEW);
   // The open document: its name, where it lives (for Save), the log length when last saved.
   const [docName, setDocName] = useState<string | null>(null);
@@ -455,15 +488,22 @@ export function App() {
     }, 300);
   }, []);
 
-  /** Run one kernel request (an op, undo or redo); the scene and push target follow. */
+  /** Run one kernel request (an op, undo or redo); the scene and push target follow.
+   * `restore` (lane 43, #7: undo and redo of a step a tool remembered) may name the selection
+   * and target to keep instead of the ones in place, still only where they exist. */
   const run = useCallback(
-    (request: (k: KernelClient) => Promise<EditResult>, op: KernelOp | null, describe?: (r: EditResult) => string): Promise<EditResult | null> => {
+    (request: (k: KernelClient) => Promise<EditResult>, op: KernelOp | null, describe?: (r: EditResult) => string, restore?: (r: EditResult) => KeptSelection | null): Promise<EditResult | null> => {
       editsPending.current++;
       const next = queue.current.then(async () => {
         const kernel = kernelRef.current;
         if (!kernel) return null;
         try {
+          const fromKey = stepKey(live.current.scene?.state);
+          const fromTarget = live.current.target;
           const r = await request(kernel);
+          // Lane 43 (#7): where the last op went from and to, for rememberSelection.
+          lastStep.current = op ? { from: fromKey, to: stepKey(r.scene.state), target: fromTarget } : null;
+          const keep = restore?.(r) ?? null;
           // Tools read the host synchronously right after this resolves (a key waiting on
           // the edit), so the live copy is updated here, not on the next render.
           live.current.scene = r.scene;
@@ -473,7 +513,7 @@ export function App() {
           const parts = r.scene.mesh.parts;
           const exists = (t: Target | null) =>
             !!t && parts.some((p) => (t.kind === "face" ? p.kind === "face" && p.owner === t.object && p.index === t.face : p.kind === "region" && p.owner === t.sketch && p.index === t.region));
-          const prev = live.current.target;
+          const prev = keep ? keep.target : live.current.target;
           const t = op ? nextTarget(op, r.outcome, prev) : exists(prev) ? prev : null;
           live.current.target = t;
           setTarget(t);
@@ -482,7 +522,7 @@ export function App() {
           // longer drawn (hidden, by the eye, a tag or a scene): Delete must never erase what
           // nobody can see.
           const g = r.scene.state.graph;
-          const sel = live.current.selection.filter((e) => {
+          const sel = (keep ? keep.selection : live.current.selection).filter((e) => {
             if (!entityShown(e, r.scene.state)) return false;
             if (e.kind === "node") {
               if (!g || !graphIndex(g).node.has(e.node)) return false;
@@ -520,11 +560,28 @@ export function App() {
   // model hash right after it, so a name is only shown for exactly that state.
   const namedSteps = useRef<{ depth: number; hash: string; name: string }[]>([]);
   const stepName = (depth: number | undefined, hash: string | undefined) => namedSteps.current.find((n) => n.depth === depth && n.hash === hash)?.name ?? null;
+  /** Lane 43 (#7): the step a remembered selection belongs to (`from` and `to`, by
+   * {@link stepKey}): Undo from `to` to `from` selects `before`; Redo from `from` to `to`
+   * selects `after`. */
+  const remembered = (from: string, to: string) => {
+    const all = stepSelections.current;
+    for (let i = all.length - 1; i >= 0; i--) if (all[i].from === from && all[i].to === to) return all[i];
+    return null;
+  };
   const undo = useCallback(
     () => {
       const before = live.current.scene?.state;
       const name = stepName(before?.undo_depth, before?.stats.hash);
-      return run((k) => k.undo(), null, (r) => `Undone${name ? `: ${name}` : ""}. ${r.scene.state.undo_depth} more step(s) to undo.`).then((r) => {
+      const at = stepKey(before);
+      return run(
+        (k) => k.undo(),
+        null,
+        (r) => `Undone${name ? `: ${name}` : ""}. ${r.scene.state.undo_depth} more step(s) to undo.`,
+        (r) => {
+          const s = remembered(stepKey(r.scene.state), at);
+          return s && { selection: s.before, target: s.beforeTarget };
+        },
+      ).then((r) => {
         if (r) afterHistoryRef.current();
         return r;
       });
@@ -533,17 +590,45 @@ export function App() {
     [run],
   );
   const redo = useCallback(
-    () =>
-      run((k) => k.redo(), null, (r) => {
-        const name = stepName(r.scene.state.undo_depth, r.scene.state.stats.hash);
-        return `Redone${name ? `: ${name}` : ""}. ${r.scene.state.redo_depth} more step(s) to redo.`;
-      }).then((r) => {
+    () => {
+      const at = stepKey(live.current.scene?.state);
+      return run(
+        (k) => k.redo(),
+        null,
+        (r) => {
+          const name = stepName(r.scene.state.undo_depth, r.scene.state.stats.hash);
+          return `Redone${name ? `: ${name}` : ""}. ${r.scene.state.redo_depth} more step(s) to redo.`;
+        },
+        (r) => {
+          const s = remembered(at, stepKey(r.scene.state));
+          return s && { selection: s.after, target: s.afterTarget };
+        },
+      ).then((r) => {
         if (r) afterHistoryRef.current();
         return r;
-      }),
+      });
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [run],
   );
+
+  // Lane 37 (#45): the file the desktop app was started with, while it waits for the answer to
+  // "Restore unsaved work?" (src/io/startup.ts): Restore offers it beside the restored work,
+  // Discard opens it. The state is for the offer's text, the ref for the answers.
+  const [startupWaiting, setStartupWaitingRaw] = useState<string | null>(null);
+  const startupWaitingRef = useRef<string | null>(null);
+  const setStartupWaiting = useCallback((path: string | null) => {
+    startupWaitingRef.current = path;
+    setStartupWaitingRaw(path);
+  }, []);
+  /** The waiting start-up file, no longer waiting. */
+  const takeStartupWaiting = useCallback(() => {
+    const path = startupWaitingRef.current;
+    if (path !== null) setStartupWaiting(null);
+    return path;
+  }, [setStartupWaiting]);
+  /** Opens a start-up file the way a dropped file opens (set below, where that is defined). */
+  const openStartupRef = useRef<(path: string) => Promise<void>>(async () => {});
 
   const restore = useCallback(
     (a: Autosave) => {
@@ -565,7 +650,12 @@ export function App() {
           setTarget(null);
           live.current.selection = [];
           setSelection([]);
-          setMessage({ text: `Restored your unsaved work: ${s.state.stats.objects} solid${s.state.stats.objects === 1 ? "" : "s"}, ${a.steps} steps (undo works as before).`, error: false });
+          const restored = `Restored your unsaved work: ${s.state.stats.objects} solid${s.state.stats.objects === 1 ? "" : "s"}, ${a.steps} steps (undo works as before).`;
+          // A start-up file was waiting for this answer: it is offered, not opened, so the
+          // restored work stays in front of the person, and opening it asks about the work.
+          const waiting = takeStartupWaiting();
+          if (waiting) setMessage({ text: `${restored} ${notOpenedNote(waiting)}`, error: false, actions: [{ label: openLabel(waiting), run: () => void openStartupRef.current(waiting) }] });
+          else setMessage({ text: restored, error: false });
           setFitSeq((n) => n + 1);
           scheduleAutosave();
         } catch (err) {
@@ -577,13 +667,16 @@ export function App() {
       void next.finally(() => editsPending.current--);
       queue.current = next;
     },
-    [scheduleAutosave],
+    [scheduleAutosave, takeStartupWaiting],
   );
   const discardRestore = useCallback(() => {
     setPendingRestore(null);
     void clearOffered();
     setMessage({ text: "Unsaved work discarded.", error: false });
-  }, []);
+    // Lane 37: a start-up file waiting for this answer opens now (its own message follows).
+    const waiting = takeStartupWaiting();
+    if (waiting) void openStartupRef.current(waiting);
+  }, [takeStartupWaiting]);
   const discardRef = useRef(discardRestore);
   discardRef.current = discardRestore;
 
@@ -592,11 +685,45 @@ export function App() {
   const dirty = !!scene && savedLogLen !== null && scene.state.log_len !== savedLogLen;
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
+  // Lane 39: in the desktop app the window's title bar shows the same text (src/io/title.ts).
   useEffect(() => {
-    document.title = `${dirty ? "• " : ""}${docName ? stem(docName) : "Untitled"} - Sawhorse`;
+    void showTitle(`${dirty ? "• " : ""}${docName ? stem(docName) : "Untitled"} - Sawhorse`);
   }, [dirty, docName]);
 
-  const confirmDiscard = useCallback(() => !dirtyRef.current || window.confirm("Discard the unsaved changes to this model?"), []);
+  /** True when the model may be replaced: it has no unsaved changes, or the person says so. Awaited: the desktop's question is asynchronous. */
+  const confirmDiscard = useCallback(async () => (dirtyRef.current ? askYesNo(discardQuestion()) : true), []);
+
+  // Lane 35 (#44): in the desktop app the shell asks before the window closes over unsaved
+  // changes (src/io/closing.ts): it is told whether there are any, and asks the page when a
+  // close request finds some. The question is the one above, with "and close Sawhorse"; Yes
+  // does to the autosave what File > New does (deletes it) and closes, No keeps everything.
+  const closeShell = useMemo(() => (isTauri() ? desktopShell() : null), []);
+  useEffect(() => {
+    void closeShell?.say(dirty ? "unsaved" : "saved").catch(() => undefined);
+  }, [closeShell, dirty]);
+  useEffect(() => {
+    if (!closeShell) return;
+    const handle = closeHandler({
+      shell: closeShell,
+      unsaved: () => dirtyRef.current,
+      discard: async () => {
+        if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+        autosaveTimer.current = null;
+        await clearAutosave();
+      },
+      failed: (text) => setMessage({ text, error: true }),
+    });
+    let off = () => {};
+    let gone = false;
+    void closeShell
+      .onRequest(() => void handle())
+      .then((f) => (gone ? f() : (off = f)))
+      .catch(() => undefined);
+    return () => {
+      gone = true;
+      off();
+    };
+  }, [closeShell, setMessage]);
 
   /** Bring a file into the model as one undo step (`.skp` through openskp, the rest through the kernel's readers). */
   const importBytes = useCallback(
@@ -614,7 +741,7 @@ export function App() {
           // Lane 15: an empty SketchUp file (a blank template) opens as an empty model in its
           // own units and style, in place of the current one.
           empty = res.empty;
-          if (!confirmDiscard()) throw new Error(`${f.name} is an empty model; the current model was kept.`);
+          if (!(await confirmDiscard())) throw new Error(`${f.name} is an empty model; the current model was kept.`);
           let n = await k.newDocument();
           const face = res.empty.style?.face;
           if (face) n = await k.apply({ op: "set_style", style: { face } } as KernelOp);
@@ -654,7 +781,7 @@ export function App() {
   /** Open a .shz in place of the current model. */
   const openBytes = useCallback(
     async (f: PickedFile) => {
-      if (!confirmDiscard()) return;
+      if (!(await confirmDiscard())) return;
       setMessage({ text: `Opening ${f.name}…`, error: false, actions: [{ label: "Cancel", run: () => void kernelRef.current?.cancel("cancelled by you") }] });
       let info: { notes: string[]; opened: { display_units: string | null } } | null = null;
       const r = await run(
@@ -723,9 +850,12 @@ export function App() {
     [takeFiles],
   );
 
-  const newDocument = useCallback(async () => {
-    if (!confirmDiscard()) return;
-    const r = await run((k) => k.newDocument(), null, () => "New model.");
+  /** File > New, and File > Close (lane 35, #44), which is the same: the current model goes
+   * (asked first over unsaved changes) and an empty untitled one takes its place. */
+  const newDocument = useCallback(async (how: "new" | "close" = "new") => {
+    if (!(await confirmDiscard())) return;
+    const closed = docName ? stem(docName) : "Untitled";
+    const r = await run((k) => k.newDocument(), null, () => (how === "close" ? `Closed ${closed}.` : "New model."));
     if (r) {
       pluginsRef.current?.documentOpened(null);
       setDocName(null);
@@ -736,7 +866,7 @@ export function App() {
       setSelection([]);
       setView("iso");
     }
-  }, [run, confirmDiscard, markClean]);
+  }, [run, confirmDiscard, markClean, docName]);
 
   const openDialog = useCallback(async () => {
     try {
@@ -860,6 +990,13 @@ export function App() {
     ).then((f) => (off = f));
     return () => off();
   }, [takeFiles]);
+  // Lane 37 (#45): the file the desktop app was started with opens exactly as a dropped one.
+  openStartupRef.current = (path: string) =>
+    takeTauriPaths(
+      [path],
+      (files) => takeFiles(files),
+      (text) => setMessage({ text, error: true }),
+    );
 
   useEffect(() => {
     const k = createKernel();
@@ -889,11 +1026,11 @@ export function App() {
           : { text: `The kernel stopped (${friendlyError(info.reason)}) and was restarted from your last step: nothing was lost, and undo works as before.`, error: true },
       );
     };
-    // Tests (?kerneltest=1): make the next import fail inside the kernel.
+    // Tests (?kerneltest=1): make the next import fail inside the kernel, or (lane 28) the next save refuse.
     try {
       if (new URLSearchParams(window.location.search).get("kerneltest") === "1") {
         const w = window as unknown as { __sawhorse?: Record<string, unknown> };
-        w.__sawhorse = { ...(w.__sawhorse ?? {}), kernelTest: { failNextImport: (how?: string) => k.failNextImport(how), restarts: () => k.restarts, wasmBytes: () => k.wasmBytes() } };
+        w.__sawhorse = { ...(w.__sawhorse ?? {}), kernelTest: { failNextImport: (how?: string) => k.failNextImport(how), failNextSave: () => k.failNextSave(), restarts: () => k.restarts, wasmBytes: () => k.wasmBytes() } };
       }
     } catch {
       /* no URL */
@@ -905,15 +1042,32 @@ export function App() {
         setScene(s);
         setKernelState("ready");
         setSavedLogLen(s.state.log_len);
-        if (!autosaveEnabled()) return;
-        // Never blocks the start (lane 16): a record that cannot be read or is too large is
-        // offered for discarding only.
-        try {
-          const saved = await takeAutosave();
-          if (worthRestoring(saved)) setPendingRestore(saved);
-        } catch {
-          /* nothing kept */
+        let offered = false;
+        if (autosaveEnabled()) {
+          // Never blocks the start (lane 16): a record that cannot be read or is too large is
+          // offered for discarding only.
+          try {
+            const saved = await takeAutosave();
+            if (worthRestoring(saved)) {
+              setPendingRestore(saved);
+              offered = true;
+            }
+          } catch {
+            /* nothing kept */
+          }
         }
+        // Lane 37 (#45): the file the desktop app was started with, asked for only now that
+        // the last run's work is set aside (opening a file deletes this session's autosave),
+        // and kept waiting while that work is offered back (src/io/startup.ts).
+        let path: string | null = null;
+        try {
+          path = await takeStartupFile();
+        } catch {
+          /* a shell that cannot say: no start-up file */
+        }
+        const order = startupOrder(path, offered);
+        if (path !== null && order === "wait") setStartupWaiting(path);
+        else if (path !== null && order === "open") void openStartupRef.current(path);
       })
       .catch((err) => {
         if (err instanceof KernelUnavailableError) {
@@ -933,8 +1087,9 @@ export function App() {
   useEffect(() => {
     if (!pendingRestore) return;
     const usable = pendingRestore.state === "ok";
+    const waiting = startupWaiting ? ` ${waitingNote(startupWaiting)}` : "";
     setMessage({
-      text: usable ? `Restore unsaved work? ${describeAutosave(pendingRestore)}.` : `Unsaved work was kept in this browser, but ${describeAutosave(pendingRestore)}; it is set aside, not loaded.`,
+      text: usable ? `Restore unsaved work? ${describeAutosave(pendingRestore)}.${waiting}` : `Unsaved work was kept in this browser, but ${describeAutosave(pendingRestore)}; it is set aside, not loaded.${waiting}`,
       error: !usable,
       actions: usable
         ? [
@@ -943,7 +1098,7 @@ export function App() {
           ]
         : [{ label: "Discard", run: discardRestore }],
     });
-  }, [pendingRestore, restore, discardRestore]);
+  }, [pendingRestore, restore, discardRestore, startupWaiting]);
 
   // Read-only hooks for e2e tests: every solid with its display number, bounds and volume,
   // and the scene graph (groups, components, the open context).
@@ -1082,6 +1237,15 @@ export function App() {
   const activeRef = useRef<Tool | null>(null);
   /** The active tool's id as of the last selectTool, ahead of the render that shows it. */
   const toolIdRef = useRef(toolId);
+  /** Lane 30: the tool Esc goes back to from the Orbit or Pan tool. */
+  const navReturnRef = useRef<ToolId>("select");
+  /** Lane 30: Alt is down and nothing else (no key, no pointer press) has happened since,
+   * so letting it go is a tap (Move's autofold, Section Plane's reverse). */
+  const altTapRef = useRef(false);
+  /** The same for Control on macOS, where Control+click is the right click (it pans): a tap
+   * of Control (Move and Rotate copy, Scale about the centre) is its release with nothing
+   * between, so a Control+drag pan does not switch copying. */
+  const ctrlTapRef = useRef(false);
   const host = useMemo<ToolHost>(
     () => ({
       units: () => live.current.units,
@@ -1111,6 +1275,14 @@ export function App() {
       },
       toScreen: (p) => engineRef.current?.worldToScreen(p) ?? [0, 0],
       target: () => live.current.target,
+      rememberSelection: (before) => {
+        // Lane 43 (#7): only for the op that just landed (nothing has changed the model since).
+        const last = lastStep.current;
+        const to = stepKey(live.current.scene?.state);
+        if (!last || last.to !== to || !to) return;
+        const step: RememberedStep = { from: last.from, to, before, beforeTarget: last.target, after: live.current.selection, afterTarget: live.current.target };
+        stepSelections.current = [...stepSelections.current.filter((s) => s.from !== step.from || s.to !== step.to).slice(-199), step];
+      },
       outline: async (t) => {
         const k = kernelRef.current;
         if (!k) return [];
@@ -1216,6 +1388,8 @@ export function App() {
       ["follow", new FollowTool(host)],
       ["paint", new PaintTool(host, paintCtx)],
       ["section", new SectionTool(host)],
+      ["orbit", new OrbitTool(host)],
+      ["pan", new PanTool(host)],
     ]);
   }
   const toolFor = (id: ToolId): Tool | null => toolsRef.current?.get(id) ?? pluginsRef.current?.toolFor(id) ?? null;
@@ -1294,6 +1468,10 @@ export function App() {
   pluginsRef.current = plugins;
 
   const onPointer = useCallback((p: ViewportPointer) => {
+    // Lane 30: a left press the camera controller took (the Orbit or Pan tool, Alt where the
+    // tool gives Alt no meaning, or on macOS Control+click, the Mac's right click) never
+    // reaches the tool, nor does its double-click; its moves still do, as during a middle-drag.
+    if ((p.type === "down" || p.type === "dblclick") && p.button === 0 && leftButtonNav(activeRef.current, p)) return;
     if (!activeRef.current) {
       if (p.type === "up" && p.button === 0) setMessage({ text: `${toolById(toolIdRef.current).label} arrives in a later lane.`, error: false });
       return;
@@ -1328,6 +1506,8 @@ export function App() {
     (id: ToolId) => {
       const prev = activeRef.current;
       prev?.deactivate();
+      // Lane 30: Esc in the Orbit or Pan tool goes back to the tool before them.
+      if (isNavTool(id) && !isNavTool(toolIdRef.current)) navReturnRef.current = toolIdRef.current;
       toolIdRef.current = id;
       setToolId(id);
       setMessage(null);
@@ -2034,7 +2214,7 @@ export function App() {
   }, [nestOpen]);
   const setNestSettings = useCallback(
     (s: NestSettings) =>
-      void apply({ op: "set_nest_settings", settings: s }, () => `Nesting: kerf ${fineU(s.kerf, nestUnits)}, trim ${s.trim > 0 ? `${fineU(s.trim, nestUnits)} per edge` : "none"}, ${s.algorithm === "guillotine" ? "table saw (straight cuts edge to edge)" : "tightest layout"}.`),
+      void apply({ op: "set_nest_settings", settings: s }, () => `Nesting: kerf ${fineU(s.kerf, nestUnits)}, trim ${s.trim > 0 ? `${fineU(s.trim, nestUnits)} per edge` : "none"}${s.jointLoss !== undefined ? `, joint loss ${fineU(s.jointLoss, nestUnits)}` : ""}, ${s.algorithm === "guillotine" ? "table saw (straight cuts edge to edge)" : "tightest layout"}.`),
     [apply, nestUnits],
   );
   const defineStock = useCallback(
@@ -2074,7 +2254,8 @@ export function App() {
     }
     for (const piece of nesting.pieces)
       for (const q of piece.placements) {
-        if ("object" in q.item ? q.item.object === object : ancestors.has(q.item.node)) return q.tag;
+        // #49: a glued part lights all its strips (by the part's tag, "4a" for "4a.2").
+        if ("object" in q.item ? q.item.object === object : ancestors.has(q.item.node)) return q.strip ? q.tag.slice(0, q.tag.lastIndexOf(".")) : q.tag;
       }
     return null;
   }, [nesting, hover, nestShown, scene]);
@@ -2221,6 +2402,9 @@ export function App() {
   // Esc, Delete, Shift+Z, and "just type" into the VCB like SketchUp.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // macOS: any other key while Control is down (Control+Z, a plugin's shortcut) makes it a
+      // chord, not a tap; first, since those keys return early below.
+      if (e.key !== "Control") ctrlTapRef.current = false;
       const inVcb = e.target === vcbRef.current;
       // Focus rules: the Value Control Box only owns the keyboard while something is being
       // typed into it; Ctrl+Z / Ctrl+Y always step the document, even mid-entry.
@@ -2277,15 +2461,27 @@ export function App() {
         }
       }
       if (sheetsMode) return;
+      // Lane 30: any other key while Alt is down makes it a chord, not a tap.
+      if (e.key !== "Alt") altTapRef.current = false;
       if (e.key === "Shift" && !textEntry) activeRef.current?.onShift(true);
-      if ((e.key === "Control" || e.key === "Alt") && !e.repeat && !textEntry) {
-        // A tap of Ctrl or Alt alone (Move / Rotate copy, Move autofold). Alt must not
-        // focus the browser's menu bar.
-        if (e.key === "Alt") e.preventDefault();
-        // After any click or tool key still on its way: the tap belongs to the tool that is
-        // active by then ("s" then Ctrl scales about the centre).
-        const mod = e.key === "Control" ? "ctrl" : "alt";
-        void afterPointer(() => activeRef.current?.onModifier(mod));
+      if (e.key === "Alt" && !e.repeat && !textEntry) {
+        // Alt must not focus the browser's menu bar. Its tap (Move's autofold, Section
+        // Plane's reverse) is the release, and only when nothing came between (lane 30):
+        // Alt held for an Alt+drag orbit is not a tap (onKeyUp, onPress).
+        e.preventDefault();
+        altTapRef.current = true;
+        return;
+      }
+      if (e.key === "Control" && !e.repeat && !textEntry) {
+        // A tap of Ctrl alone (Move / Rotate copy, Scale about the centre), after any click
+        // or tool key still on its way: the tap belongs to the tool that is active by then
+        // ("s" then Ctrl scales about the centre). On macOS the tap is the release, as Alt's
+        // is (onKeyUp, onPress): Control held for a Control+drag pan is not a tap.
+        if (isMac()) {
+          ctrlTapRef.current = true;
+          return;
+        }
+        void afterPointer(() => activeRef.current?.onModifier("ctrl"));
         return;
       }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -2293,6 +2489,13 @@ export function App() {
       if (inVcb && (e.key === "Enter" || e.key === "Escape")) return; // the box's own keys
       if (e.key === "Escape") {
         setMessage(null);
+        // Lane 30: Esc in the Orbit or Pan tool goes back to the tool before it (Select when
+        // that was a plugin's tool and its plugin has stopped since).
+        if (isNavTool(toolIdRef.current)) {
+          const back = navReturnRef.current;
+          void afterPointer(() => selectTool(isNavTool(back) || !toolFor(back) ? "select" : back));
+          return;
+        }
         if (activeRef.current?.cancel()) return;
         if (live.current.selection.length) {
           live.current.selection = [];
@@ -2368,12 +2571,32 @@ export function App() {
     };
     const onKeyUp = (e: KeyboardEvent) => {
       if (e.key === "Shift") activeRef.current?.onShift(false);
+      if (e.key === "Alt") {
+        e.preventDefault();
+        if (!altTapRef.current) return;
+        altTapRef.current = false;
+        void afterPointer(() => activeRef.current?.onModifier("alt"));
+      }
+      if (e.key === "Control" && ctrlTapRef.current) {
+        ctrlTapRef.current = false;
+        void afterPointer(() => activeRef.current?.onModifier("ctrl"));
+      }
+    };
+    // A press of any button while Alt is down (Alt+drag, Alt+click) is not an Alt tap, nor,
+    // on macOS, one while Control is down (Control+drag, Control+click) a Control tap.
+    const onPress = () => {
+      altTapRef.current = false;
+      ctrlTapRef.current = false;
     };
     window.addEventListener("keydown", onKey);
     window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("pointerdown", onPress, true);
+    window.addEventListener("blur", onPress);
     return () => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("pointerdown", onPress, true);
+      window.removeEventListener("blur", onPress);
     };
   }, [selectTool, undo, redo, zoomExtents, eraseSelection, selectAll, afterPointer, save, openDialog, importDialog, makeGroup, explode]);
 
@@ -2394,7 +2617,7 @@ export function App() {
     hud.push(
       s.objects > 0
         ? {
-            text: `${s.objects} solid${s.objects === 1 ? "" : "s"} · ${s.faces} faces · genus ${s.genus} · ${(s.volume_m3 / M_PER_IN ** 3).toFixed(1)} in³ · ${s.watertight ? "watertight" : "open"}`,
+            text: `${s.objects} solid${s.objects === 1 ? "" : "s"} · ${s.faces} faces · genus ${s.genus} · ${formatVolume(s.volume_m3, units)} · ${s.watertight ? "watertight" : "open"}`,
             tone: s.watertight ? "ok" : "err",
           }
         : { text: `Sketch: ${s.regions} region${s.regions === 1 ? "" : "s"} · draw with Rect (R)` },
@@ -2434,6 +2657,39 @@ export function App() {
   // pointer moving only adds what is under it (lane 16).
   const selectedHighlight = useMemo(() => selectionHighlight(highlightEntities, scene?.mesh ?? null, scene?.state.graph ?? null), [highlightEntities, scene]);
   const highlight = useMemo(() => withHover(selectedHighlight, highlightEntities, nestHover ?? hover, scene?.mesh ?? null, scene?.state.graph ?? null), [selectedHighlight, highlightEntities, nestHover, hover, scene]);
+  // Lane 43 (#7): the selection's highlight as the view last got it, with the mesh it names.
+  const litRef = useRef<{ h: typeof selectedHighlight; mesh: MeshData | null } | null>(null);
+  useEffect(() => {
+    litRef.current = { h: selectedHighlight, mesh: scene?.mesh ?? null };
+  }, [selectedHighlight, scene]);
+  // Lane 43 (#7): a read-only hook for tests: what is selected (each entity, its kind and ids)
+  // and what the view lights as selected (the regions, faces and imported meshes by id, and
+  // how many edge segments and points). With the Push/Pull tool and nothing selected, the lit
+  // part is its target. A copy each call: changing it changes nothing in the page.
+  useEffect(() => {
+    const w = window as unknown as { __sawhorse?: Record<string, unknown> };
+    w.__sawhorse = {
+      ...(w.__sawhorse ?? {}),
+      selected: () => {
+        const lit = litRef.current;
+        const parts = lit?.mesh?.parts ?? [];
+        const seen = new Set<string>();
+        const regions: [number, number][] = [];
+        const faces: [number, number][] = [];
+        const meshes: number[] = [];
+        for (const i of lit?.h.selectedParts ?? []) {
+          const p = parts[i];
+          if (!p || seen.has(`${p.kind}:${p.owner}:${p.index}`)) continue;
+          seen.add(`${p.kind}:${p.owner}:${p.index}`);
+          if (p.kind === "region") regions.push([p.owner, p.index]);
+          else if (p.kind === "face") faces.push([p.owner, p.index]);
+          else if (!meshes.includes(p.owner)) meshes.push(p.owner);
+        }
+        const out = { entities: live.current.selection, lit: { regions, faces, meshes, edges: lit?.h.selectedEdges.length ?? 0, points: lit?.h.selectedPoints.length ?? 0 } };
+        return JSON.parse(JSON.stringify(out)) as typeof out;
+      },
+    };
+  }, []);
 
   // Guides and dimensions draw under the tool's own overlay.
   const annotations = useMemo(() => annotationView(st ?? null, fmt, selection), [st, fmt, selection]);
@@ -2479,6 +2735,8 @@ export function App() {
       File: [
         { label: "New", onSelect: () => void newDocument() },
         { label: "Open…", keys: "Ctrl+O", onSelect: () => void openDialog() },
+        // Next to Open, where #44 looked for it (and where macOS and Windows apps keep it).
+        { label: "Close", title: "Close this model and start an empty one (asks first if there are unsaved changes)", onSelect: () => void newDocument("close") },
         { label: "Save", keys: "Ctrl+S", onSelect: () => void save(false) },
         { label: "Save As…", keys: "Ctrl+Shift+S", onSelect: () => void save(true) },
         "-",
@@ -2510,6 +2768,19 @@ export function App() {
           ],
         },
         { label: "Print Sheets…", disabled: !scene?.sheets?.length, title: "Every drawing sheet through the system print dialog, at 100%", onSelect: () => exportSheets("print-all") },
+        // The desktop app only, last after a separator: a page cannot close its browser tab.
+        // The same path as the window's X: the shell raises a close request and asks over
+        // unsaved changes.
+        ...(closeShell
+          ? [
+              "-" as const,
+              {
+                label: quitLabel(),
+                title: "Close Sawhorse (asks first if there are unsaved changes)",
+                onSelect: () => void closeShell.say("exit").catch((e) => setMessage({ text: `Could not close the window: ${e instanceof Error ? e.message : String(e)}`, error: true })),
+              },
+            ]
+          : []),
       ],
       Edit: [
         { label: `Undo${stepName(st?.undo_depth, st?.stats.hash) ? ` ${stepName(st?.undo_depth, st?.stats.hash)}` : ""}`, keys: "Ctrl+Z", disabled: !st?.can_undo, onSelect: () => void undo() },
@@ -2602,6 +2873,10 @@ export function App() {
         "-",
         ...VIEWS.map((v) => ({ label: `${v.label} view`, onSelect: () => setView(v.id) })),
         "-",
+        // Lane 30 (#36): the left button orbits or pans, for a trackpad without a middle button.
+        { label: "Orbit", keys: "O", checked: toolId === "orbit", title: "Drag with the left button to orbit (Alt+drag orbits in most tools)", onSelect: () => selectTool("orbit") },
+        { label: "Pan", keys: "H", checked: toolId === "pan", title: "Drag with the left button to pan", onSelect: () => selectTool("pan") },
+        "-",
         { label: "Add Scene", title: "Save this view (camera, hidden tags, open group) as a scene tab", onSelect: addScene },
         "-",
         // Lane 12: the style's section switches, here as in SketchUp's View menu.
@@ -2635,7 +2910,7 @@ export function App() {
         : {}),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [st?.can_undo, st?.can_redo, st?.guides?.length, st?.meshes, st?.scenes, st?.graph, st?.style, toolId, apply, undo, redo, zoomExtents, projection, setView, selectAll, eraseSelection, selection, selItems, pendingRestore, restore, newDocument, openDialog, save, importDialog, importUnits, exportAs, exportSection, sectionAction, makeGroup, makeComponent, explode, explodeCurves, addScene, goScene, activeScene, plugins.menu, mode, setMode, scene?.sheets, exportSheets, setGrid, units, chooseUnits],
+    [st?.can_undo, st?.can_redo, st?.guides?.length, st?.meshes, st?.scenes, st?.graph, st?.style, toolId, apply, undo, redo, zoomExtents, projection, setView, selectAll, eraseSelection, selection, selItems, pendingRestore, restore, newDocument, openDialog, save, importDialog, importUnits, exportAs, exportSection, sectionAction, makeGroup, makeComponent, explode, explodeCurves, addScene, goScene, activeScene, plugins.menu, mode, setMode, scene?.sheets, exportSheets, setGrid, units, chooseUnits, closeShell, setMessage],
   );
 
   const valueLabel = active?.valueLabel() ?? null;
@@ -2775,6 +3050,8 @@ export function App() {
         }}
         onEngine={(e) => {
           engineRef.current = e;
+          // Lane 30: the Orbit and Pan tools, and Alt+drag where the tool gives Alt no meaning.
+          e?.setLeftButton((mods) => leftButtonNav(activeRef.current, mods));
           setEngineObj(e);
         }}
       />

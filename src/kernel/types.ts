@@ -363,7 +363,15 @@ export type OpOutcome =
   | { kind: "copied"; objects: number[]; nodes?: number[] }
   | { kind: "geometry_moved"; faces: number[] }
   /** Lane 22: sketch geometry moved; the sketch it is in now and the (sketch, region) pairs its edges bound. */
-  | { kind: "sketch_moved"; sketch: number; regions: [number, number][]; /** Lane 23: the (sketch, curve) pairs the op's curves are now. */ curves?: [number, number][] }
+  | {
+      kind: "sketch_moved";
+      sketch: number;
+      regions: [number, number][];
+      /** Lane 23: the (sketch, curve) pairs the op's curves are now (a curve the move broke up: its first piece). */
+      curves?: [number, number][];
+      /** Lane 43 (#7): the further pieces of the op's curves that the move broke up (in their plane, or on the plane they were lifted to), as (curve in the op, sketch, piece). */
+      pieces?: [number, number, number][];
+    }
   | { kind: "sketch_copied"; regions: [number, number][]; /** Lane 23: the (sketch, curve) pairs the copies made. */ curves?: [number, number][] }
   /** Lane 23: a curve exploded into `edges` plain edges. */
   | { kind: "curve_exploded"; edges: number }
@@ -705,6 +713,8 @@ export interface InferQuery {
   dir: V3;
   px: PixelModel;
   start?: V3 | null;
+  /** Directions not to offer as lines through `start` (a lock keeps them). */
+  start_skip?: V3[];
   plane?: { origin: V3; normal: V3   /** Lane 15: the pick may be a soft or hidden edge (the Eraser with Ctrl+Shift). */
   soft?: boolean;
 } | null;
@@ -901,7 +911,7 @@ export type RequestBody =
   | { kind: "exportFile"; format: ExportFormat; options: ExportOptions }
   | { kind: "importFile"; name: string; bytes: Uint8Array; options: ImportOptions; failForTest?: string }
   | { kind: "importSkp"; name: string; bytes: Uint8Array; failForTest?: string }
-  | { kind: "saveShz"; displayUnits: string; thumbnail: Uint8Array; pluginData: string }
+  | { kind: "saveShz"; displayUnits: string; thumbnail: Uint8Array; pluginData: string; failForTest?: string }
   | { kind: "openShz"; bytes: Uint8Array }
   | { kind: "cutList"; options: CutOptions }
   | { kind: "nest"; options: NestOptions }
@@ -1151,6 +1161,8 @@ export interface NestSettings {
   /** Taken off each edge of a sheet, each end of a board (metres). */
   trim: number;
   algorithm: NestAlgorithm;
+  /** #49: the width each glue joint costs (metres); absent at the default, 1/8 in. */
+  jointLoss?: number;
 }
 
 export interface StockLibrary {
@@ -1194,6 +1206,20 @@ export interface Placement {
   size: V3;
   /** Lane 15: its part is not a solid (the rectangle is the box around its faces). */
   not_solid?: boolean;
+  /** #49: strip `n` of `of` of a part glued up for width; `dy` is the strip's width, `size` the part's. */
+  strip?: { n: number; of: number };
+}
+
+/** #49: a solid part wider than every board, glued up from strips of one board. */
+export interface GlueUp {
+  row: number;
+  copy: number;
+  tag: string;
+  name: string;
+  item: Item;
+  stock: string;
+  /** Each strip's width, in strip order (metres). */
+  widths: number[];
 }
 
 export interface StockPiece {
@@ -1260,6 +1286,8 @@ export interface Nesting {
   library: StockLibrary;
   pieces: StockPiece[];
   unplaced: Unplaced[];
+  /** #49: the parts planned as glue-ups (absent from results older than #49). */
+  glue_ups?: GlueUp[];
   totals: {
     sheets: number;
     boards: number;

@@ -3192,11 +3192,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sawhorse-close-guard"
+version = "0.1.0-alpha.5"
+
+[[package]]
 name = "sawhorse-desktop"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
+ "sawhorse-close-guard",
  "sawhorse-device-key",
  "sawhorse-safe-save",
+ "sawhorse-start-file",
+ "sawhorse-window-title",
  "serde",
  "serde_json",
  "tauri",
@@ -3208,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "sawhorse-device-key"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -3220,7 +3227,15 @@ dependencies = [
 
 [[package]]
 name = "sawhorse-safe-save"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
+
+[[package]]
+name = "sawhorse-start-file"
+version = "0.1.0-alpha.5"
+
+[[package]]
+name = "sawhorse-window-title"
+version = "0.1.0-alpha.5"
 
 [[package]]
 name = "schemars"

@@ -59,6 +59,11 @@ pub struct InferQuery {
     /// The gesture's start point (axis, parallel and perpendicular lines run from it).
     #[serde(default)]
     pub start: Option<[f64; 3]>,
+    /// Directions not to offer as lines through `start`, nor as "from point" alignments
+    /// along them: a rectangle's far corner on its own sides would have no width. A lock
+    /// keeps them all.
+    #[serde(default)]
+    pub start_skip: Vec<[f64; 3]>,
     /// Keep the result on this plane.
     #[serde(default)]
     pub plane: Option<PlaneQ>,
@@ -269,6 +274,14 @@ fn start_directions(q: &InferQuery, ctx: &Ctx) -> Vec<(DVec3, InferenceKind)> {
         }
     }
     dirs.retain(|(d, _)| ctx.in_plane(*d));
+    if q.lock.is_none() {
+        dirs.retain(|(d, _)| {
+            !q.start_skip.iter().any(|s| {
+                let s = DVec3::from_array(*s).normalize_or_zero();
+                s != DVec3::ZERO && d.cross(s).length() < 1e-9
+            })
+        });
+    }
     dirs
 }
 
@@ -657,8 +670,12 @@ pub fn infer(scene: &Scene, q: &InferQuery) -> Option<Inference> {
             let d = d.normalize();
             let on_lock =
                 (chosen.point - s).cross(d).length() <= 1e-9 * (1.0 + chosen.point.distance(s));
-            if chosen.kind.is_point() && !on_lock {
-                let p = s + d * (chosen.point - s).dot(d);
+            // A point level with the start projects back onto it: a snap to going nowhere,
+            // so the cursor keeps the line (Push/Pull dropped to 0 passing its own corners).
+            let along = (chosen.point - s).dot(d);
+            let moves = along.abs() > 1e-9 * (1.0 + chosen.point.distance(s));
+            if chosen.kind.is_point() && !on_lock && moves {
+                let p = s + d * along;
                 let from = chosen.point;
                 chosen = Cand {
                     kind: InferenceKind::FromPoint,

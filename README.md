@@ -46,7 +46,7 @@ sono sotto la stessa licenza di Sawhorse (MIT oppure Apache-2.0); i testi origin
 
 # Sawhorse
 
-**[sawhorse3d.com](https://sawhorse3d.com)** · **[Try it in your browser](https://sawhorse3d.com/app/)** (nothing to install, nothing uploaded) · [Download the desktop app](https://github.com/sawhorse3d/sawhorse/releases/tag/v0.1.0-alpha.4) (0.1.0-alpha.4, unsigned for now) · [User guide](https://sawhorse3d.com/guide/)
+**[sawhorse3d.com](https://sawhorse3d.com)** · **[Try it in your browser](https://sawhorse3d.com/app/)** (nothing to install, nothing uploaded) · [Download the desktop app](https://github.com/sawhorse3d/sawhorse/releases/tag/v0.1.0-alpha.5) (0.1.0-alpha.5, unsigned for now) · [User guide](https://sawhorse3d.com/guide/)
 
 A free, local-first, open-source push/pull 3D modeler for woodworkers and makers. Draw a rectangle, push it up, type `3/4` and press Enter. Sawhorse keeps the keys your hands already know, works out a cut list and lays your parts out on real sheets and boards as you draw, opens SketchUp files, and exports watertight files for printing and CNC. It runs in a browser tab with nothing to install, or as a desktop app on Windows, macOS and Linux. No account, no subscription, no tracking.
 
@@ -74,6 +74,8 @@ A free, local-first, open-source push/pull 3D modeler for woodworkers and makers
 
 **Plugins**: tools, panels and commands in sandboxed JavaScript with declared permissions; three samples come with the app. Writing one: [`docs/PLUGINS.md`](docs/PLUGINS.md).
 
+**Headless**: From a checkout, in its `crates/` folder (the Rust workspace), `cargo run -p sawhorse-cli -- cutlist Bookshelf.shz` prints the cut list of a saved file as JSON, and `cargo run -p sawhorse-cli -- nest Bookshelf.shz` its nesting, exactly what the app's panes read (`--visible-only`, `--rounding`, `--algorithm guillotine|maxrects`, `--pretty`; what the reader had to do to open the file goes to stderr as `note:` lines; `crates/cli`). For scripts and agents that want the numbers without the app. The installers do not include it yet.
+
 ## Not yet
 
 So nobody finds out the hard way:
@@ -81,10 +83,13 @@ So nobody finds out the hard way:
 - **`.skp` export** (you can open SketchUp files, not save them).
 - **Fillet and chamfer** tools (Follow Me can route a chamfer).
 - **Copy and paste in place**.
-- **Back and Bottom views** (Top, Front, Right, Iso and perspective are there).
 - **Text, and radius or diameter dimensions in the model** (linear dimensions only; drawing sheets have radius and diameter).
 - **Weld Edges**: erasing the line that split a circle leaves two arcs.
-- **Signed installers**: Windows and macOS warn before the first launch ([how to get past it](docs/releases/v0.1.0-alpha.4.md#unsigned-installers)).
+- **A right-click menu in the 3D view**: a right-drag pans the view, and the commands are in the menus. The Outliner, the Cut list and the scene tabs have right-click menus.
+- **A metric shop** ([#26](https://github.com/sawhorse3d/sawhorse/issues/26)): with the units on mm the drawing, the dimensions, the cut list's sizes and the view's volume are metric, but the starting stock is a US yard's (4 x 8 and 5 x 5 sheets, 4/4 to 12/4 boards 8 ft long), the cut list's totals are board feet and 4 x 8 sheets, and a sheet part placed on a sheet up to 1/16 in thinner gets no note. Your own stock can be added with the Stock… button.
+- **A question before the browser tab closes**: the desktop app asks before its window closes over unsaved changes, the browser build does not (it keeps your work as you go and offers it back the next time). On a Mac, Quit Sawhorse in the app menu (Cmd+Q) quits without asking; the red button and File > Quit Sawhorse ask.
+- **Double-clicking a `.shz` on a Mac or in a Linux file manager**: on Windows a double-click opens the model in Sawhorse (the installers associate `.shz` files with it). On a Mac and on Linux, open it with File > Open, by dragging it onto the window, or with its path after the program's name on a command line.
+- **Signed installers**: Windows and macOS warn before the first launch. On Apple Silicon alpha.4 said it was "damaged"; alpha.5 is the first build signed ad hoc, which should leave only the usual warning, and is not yet confirmed on a Mac ([how to get past both](docs/releases/v0.1.0-alpha.5.md#unsigned-installers)).
 - **Render credits**: an AI render service exists in the code but is not launched; the app shows nothing about it unless you point it at a service of your own (Edit > Settings).
 
 Known limits (model size, `.skp` versions that do not open): [docs/LIMITS.md](docs/LIMITS.md).
@@ -101,7 +106,7 @@ npm run wasm      # build the kernel to WebAssembly
 npm run dev       # open http://localhost:5173
 ```
 
-Try it: press `R` (Rectangle), type `36, 12` and press Enter; press `P` (Push/Pull), type `3/4` and press Enter: a board. Click the unit label in the bottom bar to switch between fractional inches, decimal inches, ft-in, mm, cm and m; a typed suffix (`19mm`, `2'6"`) always wins. Middle-drag orbits, right-drag pans, the wheel zooms. The ten-minute tour, every key and the inference colours: [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md).
+Try it: press `R` (Rectangle), type `36, 12` and press Enter; press `P` (Push/Pull), type `3/4` and press Enter: a board. Click the unit label in the bottom bar to switch between fractional inches, decimal inches, ft-in, mm, cm and m; a typed suffix (`19mm`, `2'6"`) always wins. Middle-drag orbits, right-drag pans, the wheel zooms; on a trackpad, Option+drag (Alt+drag) or the O key orbits. The ten-minute tour, every key and the inference colours: [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md).
 
 A production build: `npm run build:all` (kernel + app into `dist/`, servable from any static host).
 
@@ -115,6 +120,7 @@ A production build: `npm run build:all` (kernel + app into `dist/`, servable fro
 | `crates/inference` | Picking and inference snapping: own BVH, pixel tolerance at depth, occlusion, ranked inference kinds, locks |
 | `crates/import`, `crates/export`, `crates/shz` | File readers and writers, the `.shz` format |
 | `crates/wasm-api` | The wasm-bindgen surface the front end's kernel worker loads |
+| `crates/cli` | `sawhorse-cli`: the cut list or the nesting of a saved `.shz` as JSON, with no app (`cargo run -p sawhorse-cli -- cutlist Bookshelf.shz`, in `crates/`) |
 | `packages/plugin-api` | The plugin API's types, runtime and checks |
 | `src-tauri/` | Tauri 2 desktop shell |
 | `site/` | The public site's landing page; `scripts/build-site.mjs` adds the demo, the guide and the changelog |
@@ -127,6 +133,10 @@ npx vitest run                                   # front end
 bash scripts/cargo.sh test --workspace           # kernel: unit, property, fuzzer, repro, golden
 PW_CHANNEL=msedge REQUIRE_KERNEL=1 npx playwright test
 ```
+
+## Contributing
+
+Reports, fixes, larger work and testing on real hardware are all welcome; [`CONTRIBUTING.md`](CONTRIBUTING.md) says how each fits (AI-assisted pull requests included).
 
 ## Credits
 

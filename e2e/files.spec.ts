@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { FAMILIES, rng } from "../src/io/corpus/models";
+import { IN, near, solids, type Solid, type V3 } from "./helpers";
 
 // Lane 6: the File menu, import, export, save and open, drag-and-drop, on the production
 // browser build. `?io=basic` uses the file input and downloads (the File System Access
@@ -63,7 +64,7 @@ test("the File menu: open, save, import, units and every export", async ({ page 
   await page.goto("/");
   await page.getByRole("button", { name: "File", exact: true }).click();
   const items = page.getByRole("menu", { name: "File" }).locator(":scope > button, :scope > .subwrap > button");
-  await expect(items).toHaveText([/New/, /Open…\s*Ctrl\+O/, /Save\s*Ctrl\+S/, /Save As…/, /Import…\s*Ctrl\+I/, /Import units/, /Export/, /Print Sheets…/]);
+  await expect(items).toHaveText([/New/, /Open…\s*Ctrl\+O/, "Close", /Save\s*Ctrl\+S/, /Save As…/, /Import…\s*Ctrl\+I/, /Import units/, /Export/, /Print Sheets…/]);
   await page.getByRole("menuitem", { name: "Export", exact: true }).hover();
   await expect(page.getByRole("menu", { name: "Export" }).getByRole("menuitem")).toHaveText([
     "STL…",
@@ -110,6 +111,44 @@ test("import an STL, export STL and 3MF, re-import the STL", async ({ page }) =>
   await expect(vp).toHaveAttribute("data-objects", "1");
 });
 
+// Lane 34 (#47, #48): Sawhorse writes STL and OBJ in millimetres and says so inside the file,
+// but the importer read them in File > Import units: with it on Inches, every export and
+// import made a part 25.4 times bigger. Sawhorse's own files now come back at their size.
+test("with Import units on Inches, an STL and an OBJ that Sawhorse exported come back at their size", async ({ page }) => {
+  const vp = await ready(page);
+  await page.getByRole("button", { name: "File", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Import units", exact: true }).hover();
+  await page.getByRole("menuitemcheckbox", { name: "Inches (STL, OBJ, unitless DXF)" }).click();
+  expect(await page.evaluate(() => localStorage.getItem("sawhorse.importUnits"))).toBe("in");
+  const rail: V3 = [48, 3.5, 1.5];
+  const size = (s: Solid) => s.max.map((m, k) => m - s.min[k]) as V3;
+  const volume = 48 * 3.5 * 1.5 * IN ** 3;
+
+  // Another program's STL (a header that is not ours), its numbers in inches: the menu holds.
+  await pick(page, "rail.stl", stlBoxes([{ at: [0, 0, 0], size: rail }]));
+  await expect(vp).toHaveAttribute("data-objects", "1");
+  await expect(page.getByTestId("import-report")).toContainText("STL has no units; read as inches (File > Import units)");
+  near(size((await solids(page))[0]), rail);
+
+  // Our STL, out and back in: 48 in long, not 48 x 25.4.
+  const stl = await download(page, () => menu(page, "File", "Export", "STL…"));
+  expect(stl.bytes.subarray(0, 35).toString("latin1")).toBe("Sawhorse binary STL; units mm; Z up");
+  await pick(page, "rail-again.stl", stl.bytes);
+  await expect(vp).toHaveAttribute("data-objects", "2");
+  await expect(page.getByTestId("import-report")).toContainText("Sawhorse STL: read as millimetres, as its header says (File > Import units is for other STL files)");
+  for (const s of await solids(page)) near(size(s), rail);
+  expect(Number(await vp.getAttribute("data-volume"))).toBeCloseTo(2 * volume, 7);
+
+  // Our OBJ of both rails, out and back in.
+  const obj = await download(page, () => menu(page, "File", "Export", "OBJ…"));
+  expect(obj.bytes.toString("utf8").split("\n")[0]).toBe("# Sawhorse OBJ; units mm; Z up");
+  await pick(page, "rails.obj", obj.bytes);
+  await expect(vp).toHaveAttribute("data-objects", "4");
+  await expect(page.getByTestId("import-report")).toContainText("Sawhorse OBJ: read as millimetres, as its first line says (File > Import units is for other OBJ files)");
+  for (const s of await solids(page)) near(size(s), rail);
+  expect(Number(await vp.getAttribute("data-volume"))).toBeCloseTo(4 * volume, 7);
+});
+
 test("an open mesh comes in visible, is named in the HUD, and STL export refuses it by name", async ({ page }) => {
   const vp = await ready(page);
   await pick(page, "tray.stl", stlBoxes([{ at: [0, 0, 0], size: [50, 50, 20] }], true));
@@ -144,6 +183,89 @@ test("save as .shz, start a new model, open the file again", async ({ page }) =>
   await expect(page).toHaveTitle("parts - Sawhorse");
   // Nothing to undo in a freshly opened file.
   await expect(page.locator(".hud")).toContainText("undo 0");
+});
+
+// Lane 28: when Save's own file would not open as the same model (the read-back check, made
+// to fail here through ?kerneltest=1), nothing is written, the status says what to do, and the
+// work stays: the model, its undo, the unsaved mark. The next Ctrl+S saves it.
+test("a save refused by its read-back check writes nothing and keeps the unsaved work", async ({ page }) => {
+  await page.goto("/?io=basic&kerneltest=1");
+  const vp = page.locator("main.vp");
+  await expect(vp).not.toHaveAttribute("data-kernel", "loading", { timeout: 15_000 });
+  if (!requireKernel && (await vp.getAttribute("data-kernel")) === "missing") test.skip(true, "kernel WASM not built (run npm run wasm)");
+  await expect(vp).toHaveAttribute("data-kernel", "ready");
+  await pick(page, "parts.stl", stlBoxes([{ at: [0, 0, 0], size: [40, 40, 40] }, { at: [100, 0, 0], size: [20, 30, 10] }]));
+  await expect(vp).toHaveAttribute("data-objects", "2");
+  const hash = await vp.getAttribute("data-hash");
+  await expect(page).toHaveTitle("• Untitled - Sawhorse");
+  const downloads: string[] = [];
+  page.on("download", (d) => downloads.push(d.suggestedFilename()));
+  await page.evaluate(() => (window as unknown as { __sawhorse: { kernelTest: { failNextSave(): void } } }).__sawhorse.kernelTest.failNextSave());
+  await page.keyboard.press("Control+s");
+  await expect(page.locator("#hint")).toHaveText(
+    "Can't do that. Could not save: the saved copy would not have opened as the same model, so nothing was written; File > Export keeps the shapes. Please report this.",
+  );
+  expect(downloads).toEqual([]);
+  // The work is all still there, unsaved, and undoable.
+  await expect(page).toHaveTitle("• Untitled - Sawhorse");
+  await expect(vp).toHaveAttribute("data-objects", "2");
+  await expect(vp).toHaveAttribute("data-hash", hash!);
+  await expect(page.locator(".hud")).toContainText("undo 1");
+  // Export still writes the shapes.
+  const stl = await download(page, () => menu(page, "File", "Export", "STL…"));
+  expect(stl.bytes.length).toBeGreaterThan(84);
+  // The next save writes the model, and it opens as the same one.
+  const saved = await download(page, () => page.keyboard.press("Control+s"));
+  await expect(page).toHaveTitle("Untitled - Sawhorse");
+  await menu(page, "File", "New");
+  await expect(vp).toHaveAttribute("data-objects", "0");
+  await pick(page, "parts.shz", saved.bytes);
+  await expect(vp).toHaveAttribute("data-hash", hash!);
+});
+
+test("over unsaved changes, Open and New wait for the answer, even the desktop's asynchronous one", async ({ page }) => {
+  // The desktop app's dialog plugin replaces window.confirm with one that returns a Promise
+  // (truthy whatever the answer, to code that does not wait). The same stand-in here: it
+  // answers after a moment, No at first.
+  await page.addInitScript(() => {
+    const w = window as unknown as { confirm: (m: string) => unknown; __asked: string[]; __answer: boolean };
+    w.__asked = [];
+    w.__answer = false;
+    w.confirm = (m: string) => {
+      w.__asked.push(m);
+      return new Promise((r) => setTimeout(() => r(w.__answer), 150));
+    };
+  });
+  const asked = () => page.evaluate(() => (window as unknown as { __asked: string[] }).__asked);
+  const vp = await ready(page);
+  await pick(page, "parts.stl", stlBoxes([{ at: [0, 0, 0], size: [40, 40, 40] }]));
+  await expect(vp).toHaveAttribute("data-objects", "1");
+  const saved = await download(page, () => page.keyboard.press("Control+s"));
+  await expect(page).toHaveTitle("Untitled - Sawhorse");
+  // An import adds to the model: unsaved changes.
+  await pick(page, "more.stl", stlBoxes([{ at: [100, 0, 0], size: [20, 30, 10] }]));
+  await expect(vp).toHaveAttribute("data-objects", "2");
+  await expect(page).toHaveTitle("• Untitled - Sawhorse");
+
+  // Open over them: asked, and No keeps the model.
+  await pick(page, "parts.shz", saved.bytes);
+  await expect.poll(asked).toEqual(["Discard the unsaved changes to this model?"]);
+  await page.waitForTimeout(500);
+  await expect(vp).toHaveAttribute("data-objects", "2");
+  await expect(page).toHaveTitle("• Untitled - Sawhorse");
+
+  // New over them: asked, and No keeps the model.
+  await menu(page, "File", "New");
+  await expect.poll(async () => (await asked()).length).toBe(2);
+  await page.waitForTimeout(500);
+  await expect(vp).toHaveAttribute("data-objects", "2");
+
+  // Yes opens the file.
+  await page.evaluate(() => ((window as unknown as { __answer: boolean }).__answer = true));
+  await pick(page, "parts.shz", saved.bytes);
+  await expect(vp).toHaveAttribute("data-objects", "1");
+  await expect(page).toHaveTitle("parts - Sawhorse");
+  expect((await asked()).length).toBe(3);
 });
 
 test("drag and drop: an SVG becomes sketch regions on the ground", async ({ page }) => {

@@ -19,8 +19,13 @@ export interface FileType {
   extensions: string[];
 }
 
-/** Where a picked or saved file lives, so Save can write it again. */
-export type FileHandle = { kind: "fsa"; handle: FsaFileHandle } | { kind: "tauri"; path: string };
+/**
+ * Where a picked or saved file lives, so Save can write it again. On the desktop, `chosen`
+ * is the path the Save dialog returned when the type's extension was added here (`path` is
+ * it plus the extension); every later save sends it along, so the shell can see the file is
+ * the person's own.
+ */
+export type FileHandle = { kind: "fsa"; handle: FsaFileHandle } | { kind: "tauri"; path: string; chosen?: string };
 
 export interface PickedFile {
   name: string;
@@ -83,6 +88,16 @@ export function baseName(path: string): string {
   return path.replace(/^.*[\\/]/, "");
 }
 
+/**
+ * `path` with one of `type`'s extensions: as it is when it already ends in one (any case),
+ * else with the first appended. The desktop's Save dialog hands the name back as typed on
+ * Linux (GTK's chooser adds no extension; Windows and macOS add the filter's), and a file
+ * saved without one is then hidden by the Open dialog's filter.
+ */
+export function withExtension(path: string, type: FileType): string {
+  return type.extensions.includes(extensionOf(path)) ? path : `${path}${type.extensions[0]}`;
+}
+
 /** The name without its extension. */
 export function stem(name: string): string {
   return baseName(name).replace(/\.[^.]*$/, "") || "Untitled";
@@ -92,6 +107,20 @@ export function stem(name: string): string {
 
 export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+/**
+ * Ask a yes/no question and wait for the answer. In the browser that is `window.confirm`. In
+ * the desktop app the dialog plugin replaces `window.confirm` with an asynchronous one that
+ * hands back a Promise (truthy whatever the answer, to code that does not wait), so there the
+ * question goes through the plugin's own dialog, with the app's name on it, and is awaited.
+ */
+export async function askYesNo(message: string): Promise<boolean> {
+  if (isTauri()) {
+    const { confirm } = await import("@tauri-apps/plugin-dialog");
+    return confirm(message, { title: "Sawhorse", kind: "warning" });
+  }
+  return window.confirm(message);
 }
 
 interface FsaWritable {
@@ -240,17 +269,44 @@ export async function saveFile(name: string, bytes: Uint8Array, type: FileType, 
   const { signal } = opts;
   if (signal?.aborted) return null;
   if (isTauri()) {
-    let path = handle?.kind === "tauri" ? handle.path : null;
-    if (!path) {
+    let path: string;
+    let chosen: string | undefined;
+    const again = handle?.kind === "tauri";
+    if (handle?.kind === "tauri") {
+      path = handle.path;
+      chosen = handle.chosen;
+    } else {
       const { save } = await import("@tauri-apps/plugin-dialog");
-      path = await save({ defaultPath: name, filters: [{ name: type.description, extensions: type.extensions.map((e) => e.slice(1)) }] });
-      if (!path || signal?.aborted) return null;
+      const picked = await save({ defaultPath: name, filters: [{ name: type.description, extensions: type.extensions.map((e) => e.slice(1)) }] });
+      if (!picked || signal?.aborted) return null;
+      // GTK's chooser hands the name back as typed (Windows and macOS add the filter's
+      // extension): a name without one of the type's gets the type's first, and the dialog's
+      // own path travels with the save so the shell can see the file is the person's
+      // (src-tauri/src/lib.rs, save_file_atomic; sawhorse-safe-save, decide).
+      path = withExtension(picked, type);
+      if (path !== picked) chosen = picked;
     }
     // Lane 16: written beside, synced, read back, then renamed over the file (the previous
     // one kept as .bak), never truncated in place (src-tauri/safe-save).
     const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("save_file_atomic", bytes, { headers: { "x-path": encodeURIComponent(path) } });
-    return { name: baseName(path), handle: { kind: "tauri", path } };
+    const headers: Record<string, string> = { "x-path": encodeURIComponent(path) };
+    if (chosen) {
+      headers["x-chosen"] = encodeURIComponent(chosen);
+      // Saving again to the file this handle made: the person's own, no question.
+      if (again) headers["x-replace"] = "yes";
+    }
+    try {
+      await invoke("save_file_atomic", bytes, { headers });
+    } catch (e) {
+      // The extension was added here and a file of that name exists: the dialog asked
+      // about the typed name, not this one, so the shell refuses until the person agrees.
+      const message = e instanceof Error ? e.message : String(e);
+      if (!message.startsWith("exists:")) throw e;
+      if (!(await askYesNo(`${baseName(path)} already exists. Replace it?`))) return null;
+      if (signal?.aborted) return null;
+      await invoke("save_file_atomic", bytes, { headers: { ...headers, "x-replace": "yes" } });
+    }
+    return { name: baseName(path), handle: chosen ? { kind: "tauri", path, chosen } : { kind: "tauri", path } };
   }
   // The classroom edition keeps every saved or exported file in the person's Google Drive.
   if (schoolHooks.deliver) {
@@ -300,16 +356,24 @@ export function download(name: string, bytes: Uint8Array, mime: string): void {
 export async function onTauriDrop(cb: (files: PickedFile[]) => Promise<void> | void, refused?: (message: string) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<string[]>("sawhorse://dropped", async (e) => {
-    // One at a time (lane 16): each file is measured, read and taken in before the next is
-    // read, so dropping several large files never holds them all at once.
-    for (const path of e.payload) {
-      if (!ALL_EXTENSIONS.includes(extensionOf(path))) continue;
-      try {
-        await cb([{ name: baseName(path), bytes: await readTauriFile(path), handle: { kind: "tauri", path } }]);
-      } catch (err) {
-        refused?.(err instanceof Error ? err.message : String(err));
-      }
+  return listen<string[]>("sawhorse://dropped", (e) => takeTauriPaths(e.payload, cb, refused));
+}
+
+/**
+ * Desktop: read files the shell allowed in the fs scope (dropped on the window, or the file
+ * the app was started with, src/io/startup.ts) and hand each to `cb`, the same way for both:
+ * a name File > Open does not take is skipped, a file over its limit is refused before it is
+ * read, and a file that cannot be read goes to `refused` with the reason.
+ */
+export async function takeTauriPaths(paths: readonly string[], cb: (files: PickedFile[]) => Promise<void> | void, refused?: (message: string) => void): Promise<void> {
+  // One at a time (lane 16): each file is measured, read and taken in before the next is
+  // read, so dropping several large files never holds them all at once.
+  for (const path of paths) {
+    if (!ALL_EXTENSIONS.includes(extensionOf(path))) continue;
+    try {
+      await cb([{ name: baseName(path), bytes: await readTauriFile(path), handle: { kind: "tauri", path } }]);
+    } catch (err) {
+      refused?.(err instanceof Error ? err.message : String(err));
     }
-  });
+  }
 }

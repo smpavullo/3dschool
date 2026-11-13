@@ -99,6 +99,9 @@ const IT: Record<string, string> = {
   Top: "Alto",
   Front: "Fronte",
   Right: "Destra",
+  Back: "Dietro",
+  Left: "Sinistra",
+  Bottom: "Sotto",
   Persp: "Prosp.",
   "Iso view": "Vista isometrica",
   "Top view": "Vista dall'alto",
@@ -109,6 +112,31 @@ const IT: Record<string, string> = {
   "Top view, looking down -Z": "Vista dall'alto, guardando lungo -Z",
   "Front view, looking along +Y": "Vista frontale, guardando lungo +Y",
   "Right view, looking along -X": "Vista da destra, guardando lungo -X",
+  "Back view": "Vista da dietro",
+  "Left view": "Vista da sinistra",
+  "Bottom view": "Vista da sotto",
+  "Back view, looking along -Y": "Vista da dietro, guardando lungo -Y",
+  "Left view, looking along +X": "Vista da sinistra, guardando lungo +X",
+  "Bottom view, looking up +Z (the front edge at the top, +X runs right)": "Vista da sotto, guardando in su lungo +Z (il bordo anteriore in alto, +X verso destra)",
+  // orbit and pan with the left button, File > Close (Sawhorse 0.1.0-alpha.5)
+  Orbit: "Orbita",
+  Pan: "Panoramica",
+  "Orbit (O)": "Orbita (O)",
+  "Pan (H)": "Panoramica (H)",
+  "Drag with the left button to orbit (Alt+drag orbits in most tools)": "Trascina con il tasto sinistro per orbitare (Alt+trascina orbita in quasi tutti gli strumenti)",
+  "Drag with the left button to pan": "Trascina con il tasto sinistro per spostare la vista",
+  "Drag to orbit around the point under the cursor. Shift+drag pans. Esc goes back to the tool before.":
+    "Trascina per orbitare attorno al punto sotto il cursore. Maiusc+trascina sposta la vista. Esc torna allo strumento di prima.",
+  "Drag to pan: the point you grab stays under the cursor. Esc goes back to the tool before.":
+    "Trascina per spostare la vista: il punto che afferri resta sotto il cursore. Esc torna allo strumento di prima.",
+  "Click a face to paint the active material. Alt+click picks one up; press O to orbit.":
+    "Fai clic su una faccia per colorarla con il materiale attivo. Alt+clic ne preleva uno; premi O per orbitare.",
+  "Click a face to cut the model there. Alt reverses it, the arrow keys lock it to an axis, Enter places it. Press O to orbit.":
+    "Fai clic su una faccia per tagliare lì il modello. Alt lo inverte, i tasti freccia lo bloccano su un asse, Invio lo posiziona. Premi O per orbitare.",
+  Close: "Chiudi",
+  "Close this model and start an empty one (asks first if there are unsaved changes)": "Chiudi questo modello e iniziane uno vuoto (prima chiede, se ci sono modifiche non salvate)",
+  "New model.": "Nuovo modello.",
+  "Joint loss": "Perdita per giunto",
   "Three-quarter perspective view": "Vista prospettica a tre quarti",
   Perspective: "Prospettiva",
   Views: "Viste",
@@ -246,7 +274,8 @@ const IT: Record<string, string> = {
   Endpoints: "Estremi",
   Midpoint: "Punto medio",
   // longer explanations
-  "Click an entity. Drag for a window. Double-click a group to edit it.": "Fai clic su un elemento. Trascina per una finestra di selezione. Doppio clic su un gruppo per modificarlo.",
+  "Click an entity. Drag for a window. Double-click a group to edit it. Alt+drag orbits.":
+    "Fai clic su un elemento. Trascina per una finestra di selezione. Doppio clic su un gruppo per modificarlo. Alt+trascina orbita.",
   "Select solids (open a group or component to reach its solids).": "Seleziona i solidi (apri un gruppo o un componente per raggiungerli).",
   "Select.": "Seleziona.",
   "Double-click in the model to edit in place (Esc leaves). Double-click a name to rename. Right-click for Make Group, Make Component, Make Unique, Explode, Lock.":
@@ -377,6 +406,7 @@ const PATTERNS: Array<[RegExp, (m: RegExpExecArray) => string]> = [
   [/^Section (\d+)$/, (m) => `Sezione ${m[1]}`],
   [/^Scene (\d+)$/, (m) => `Scena ${m[1]}`],
   [/^(\d+) solids? · (\d+) faces? · genus (\d+) · (.+) · watertight$/, (m) => `${m[1]} solidi · ${m[2]} facce · genere ${m[3]} · ${m[4]} · chiuso`],
+  [/^Closed (.+)\.$/, (m) => `Chiuso ${m[1] === "Untitled" ? "Senza titolo" : m[1]}.`],
   [/^Hide (.+)$/, (m) => `Nascondi ${m[1]}`],
   [/^Show (.+)$/, (m) => `Mostra ${m[1]}`],
   [/^(.+)\. Ctrl\+Z undoes it in one step\.$/, (m) => `${m[1]}. Ctrl+Z lo annulla in un solo passo.`],

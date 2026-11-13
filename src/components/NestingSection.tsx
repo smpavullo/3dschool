@@ -4,11 +4,11 @@
 // stock takes, with why; then one diagram per sheet or board, drawn to scale, each part
 // labelled with its tag (hover: its name and size, and the part lights up in the model;
 // click: select it), the cuts in order underneath; and the SVG, DXF and PDF exports.
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { NestAlgorithm, Nesting, NestSettings, Placement, StockPiece } from "../kernel/types";
 import { parseLength, type UnitSystem } from "../lib/units";
 import { diagram } from "../nesting/diagram";
-import { ALGORITHMS, cutText, dims, fineU, type Units, nestNote, nestSummary, pieceNumber, pieceYield, reasonText } from "../nesting/format";
+import { ALGORITHMS, cutText, dims, fineU, glueText, JOINT_LOSS_DEFAULT, type Units, nestNote, nestSummary, pieceNumber, pieceYield, placedSize, reasonText, stripText } from "../nesting/format";
 
 export interface NestingSectionProps {
   nesting: Nesting | null;
@@ -38,19 +38,36 @@ function LengthField({ label, value, units, rounding, max, onCommit }: { label: 
   const [text, setText] = useState(shown);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => setText(shown), [shown]);
+  // Lane 30 (from the #33 review): a commit reads the value and the settings as they are
+  // now, not as they were when the pause timer was set. The timer used to keep its render's:
+  // Enter, then the pause, committed the same length twice, and a change from outside while
+  // a typed length waited (a plugin, Redo) was undone in the other field when it fired.
+  const now = useRef({ value, shown, units, rounding, max, label, onCommit });
+  now.current = { value, shown, units, rounding, max, label, onCommit };
+  const timer = useRef<number | null>(null);
+  const stopTimer = () => {
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+  };
   const commit = (t: string) => {
-    if (t.trim() === shown) return setErr(null);
-    const r = parseLength(t, units);
+    // Enter or leaving the field commits now; the pause has nothing left to do.
+    stopTimer();
+    const c = now.current;
+    if (t.trim() === c.shown) return setErr(null);
+    const r = parseLength(t, c.units);
     if (!r.ok) return setErr(r.error);
-    if (r.metres < 0 || r.metres > max) return setErr(`${label}: 0 to ${fineU(max, rounding)}.`);
+    if (r.metres < 0 || r.metres > c.max) return setErr(`${c.label}: 0 to ${fineU(c.max, c.rounding)}.`);
     setErr(null);
-    if (Math.abs(r.metres - value) > 1e-9) onCommit(r.metres);
+    if (Math.abs(r.metres - c.value) > 1e-9) c.onCommit(r.metres);
   };
   // A short pause after typing re-nests too.
   useEffect(() => {
     if (text === shown) return;
-    const t = window.setTimeout(() => commit(text), 700);
-    return () => window.clearTimeout(t);
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      commit(text);
+    }, 700);
+    return stopTimer;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text]);
   return (
@@ -77,6 +94,7 @@ function LengthField({ label, value, units, rounding, max, onCommit }: { label: 
 
 const KERF_MAX = 0.5 * 0.0254;
 const TRIM_MAX = 4 * 0.0254;
+const JOINT_LOSS_MAX = 0.5 * 0.0254;
 
 function PieceDiagram({ piece, rounding, lit, onHover, onSelect }: { piece: StockPiece; rounding: Units; lit?: string | null; onHover: (p: Placement | null) => void; onSelect: (p: Placement) => void }) {
   const d = useMemo(() => diagram(piece), [piece]);
@@ -99,7 +117,8 @@ function PieceDiagram({ piece, rounding, lit, onHover, onSelect }: { piece: Stoc
       <rect className="stock" x={0} y={0} width={d.width * S} height={d.height * S} />
       {d.usable ? <rect className="trim" x={d.usable.x * S} y={d.usable.y * S} width={d.usable.w * S} height={d.usable.h * S} /> : null}
       {d.parts.map((q) => {
-        const on = over === q.p.tag || lit === q.p.tag;
+        // #49: the model's part lights every strip of its glue-up ("4a" lights "4a.1", "4a.2").
+        const on = over === q.p.tag || lit === q.p.tag || (!!q.p.strip && lit === q.p.tag.slice(0, q.p.tag.lastIndexOf(".")));
         const fs = Math.max(0, Math.min(font, (q.w * S * 0.9) / (q.p.tag.length * 0.62), q.h * S * 0.8));
         return (
           <g
@@ -112,7 +131,7 @@ function PieceDiagram({ piece, rounding, lit, onHover, onSelect }: { piece: Stoc
             }}
             onClick={() => onSelect(q.p)}
           >
-            <title>{`${q.p.tag} ${q.p.name}: ${dims(q.p.size[1], q.p.size[2], rounding)}${q.p.turned ? " (turned)" : ""}. Click to select it in the model.`}</title>
+            <title>{`${q.p.tag} ${q.p.name}${stripText(q.p)}: ${dims(...placedSize(q.p), rounding)}${q.p.turned ? " (turned)" : ""}. Click to select it in the model.`}</title>
             <rect x={q.x * S} y={q.y * S} width={q.w * S} height={q.h * S} />
             {fs > font * 0.18 ? (
               <text x={(q.x + q.w / 2) * S} y={(q.y + q.h / 2) * S + fs * 0.35} fontSize={fs}>
@@ -157,6 +176,7 @@ export function NestingSection(p: NestingSectionProps) {
           </label>
           <LengthField label="Kerf" value={settings.kerf} units={p.units} rounding={r} max={KERF_MAX} onCommit={(kerf) => set({ kerf })} />
           <LengthField label="Trim" value={settings.trim} units={p.units} rounding={r} max={TRIM_MAX} onCommit={(trim) => set({ trim })} />
+          <LengthField label="Joint loss" value={settings.jointLoss ?? JOINT_LOSS_DEFAULT} units={p.units} rounding={r} max={JOINT_LOSS_MAX} onCommit={(jointLoss) => set({ jointLoss })} />
         </div>
       ) : null}
       {p.problem ? <p className="note err">{p.problem}</p> : null}
@@ -188,6 +208,18 @@ export function NestingSection(p: NestingSectionProps) {
                   <li key={u.tag}>
                     <span className="tag">{u.tag}</span> {u.name}: {reasonText(u)}
                   </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {n.glue_ups?.length ? (
+            <div className="nest-glued" data-testid="nest-glued">
+              <b>
+                {n.glue_ups.length} part{n.glue_ups.length === 1 ? "" : "s"} glued up for width
+              </b>
+              <ul>
+                {n.glue_ups.map((g) => (
+                  <li key={g.tag}>{glueText(g, r)}</li>
                 ))}
               </ul>
             </div>
@@ -231,7 +263,8 @@ export function NestingSection(p: NestingSectionProps) {
                 <ul className="nest-parts">
                   {piece.placements.map((q) => (
                     <li key={q.tag}>
-                      <span className="tag">{q.tag}</span> {q.name} {dims(q.size[1], q.size[2], r)}
+                      <span className="tag">{q.tag}</span> {q.name}
+                      {stripText(q)} {dims(...placedSize(q), r)}
                       {q.turned ? " (turned)" : ""}
                     </li>
                   ))}

@@ -1,10 +1,15 @@
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { Entity, KernelOp, MeshData, Picked, V3 } from "../kernel/types";
+import type { Entity, KernelOp, MeshData, OpOutcome, Picked, V3, WasmDoc, Xform } from "../kernel/types";
 import { ev, fakeHost } from "./fakeHost";
 import { MoveTool, moveOp } from "./move";
+import { rotateOp } from "./rotate";
+import { scaleOp } from "./scale";
 import { setNameSource } from "../lib/names";
+import { nextTarget } from "../lib/edit";
 import type { DocState } from "../kernel/types";
-import { applyX, describeSubject, movedSelection, previewSegments, rotation, scaling, sketchPreviews, sketchSegments, subjectOf, translation, type Subject } from "./xform";
+import { applyX, describeSubject, loadOutlines, movedSelection, previewSegments, rotation, scaling, sketchesAfter, sketchPointMap, sketchPreviews, sketchSegments, subjectOf, targetAfterMove, translation, type Subject } from "./xform";
 
 const IN = 0.0254;
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -111,6 +116,271 @@ describe("transform helpers", () => {
     const lift = { ...pv[0], liftable: true };
     const lifted = movedSelection([region, edge], s, [lift], translation([0, 0, 1]), { kind: "sketch_moved", sketch: 5, regions: [[5, 9]] });
     expect(lifted).toEqual([{ kind: "region", sketch: 5, region: 9 }, { ...edge, owner: { kind: "sketch", id: 5 }, a: [0, 0, 1], b: [1, 0, 1] }]);
+  });
+
+  it("#7: a region moved within its plane that splits is selected as the pieces it became, not its old id", () => {
+    // Region 1, a unit square, moved 2 to the right across a rectangle. The kernel says the
+    // moved edges now bound regions 4 and 5 (inside the moved square) and 2 (the rectangle's
+    // remainder, outside it). Region 1 itself no longer exists.
+    const sq: V3[] = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]];
+    const region: Entity = { kind: "region", sketch: 1, region: 1 };
+    const s = subjectOf([region], null, new Map([["r1:1", [sq]]])) as Subject;
+    const pv = sketchPreviews(s, null);
+    // One triangle per region, in the plane z = 0: 4 and 5 inside x 2..3, y 0..1; 2 outside.
+    const tri = (cx: number, cy: number) => [cx - 0.1, cy - 0.1, 0, cx + 0.1, cy - 0.1, 0, cx, cy + 0.1, 0];
+    const part = (index: number) => ({ kind: "region" as const, owner: 1, index, origin: [0, 0, 0] as V3, normal: [0, 0, 1] as V3, u: [1, 0, 0] as V3, v: [0, 1, 0] as V3 });
+    const mesh: MeshData = {
+      positions: new Float32Array([...tri(2.25, 0.5), ...tri(5, 0.5), ...tri(2.75, 0.5)]),
+      indices: new Uint32Array([0, 1, 2, 3, 4, 5, 6, 7, 8]),
+      faceIds: new Uint32Array([0, 1, 2]),
+      edges: new Float32Array(),
+      edgeOwner: new Uint32Array(),
+      edgeOwners: [],
+      parts: [part(4), part(2), part(5)],
+    };
+    const moved = movedSelection([region], s, pv, translation([2, 0, 0]), { kind: "sketch_moved", sketch: 1, regions: [[1, 2], [1, 4], [1, 5]] }, mesh);
+    expect(moved).toEqual([
+      { kind: "region", sketch: 1, region: 4 },
+      { kind: "region", sketch: 1, region: 5 },
+    ]);
+    // A move that splits nothing: the kernel reports the region itself, which stays selected.
+    const plainMesh: MeshData = { ...mesh, positions: new Float32Array(tri(2.5, 0.5)), indices: new Uint32Array([0, 1, 2]), faceIds: new Uint32Array([0]), parts: [part(1)] };
+    expect(movedSelection([region], s, pv, translation([2, 0, 0]), { kind: "sketch_moved", sketch: 1, regions: [[1, 1]] }, plainMesh)).toEqual([region]);
+  });
+
+  it("#7: Push/Pull's next target follows a selected region a move turned into pieces: the one piece, or none", () => {
+    const r = (region: number): Entity => ({ kind: "region", sketch: 1, region });
+    const t = (region: number) => ({ kind: "region" as const, sketch: 1, region });
+    // Split into two pieces (the old id is one of them): no target, so P waits for a click
+    // instead of pushing the one piece the old id now names.
+    expect(targetAfterMove(t(1), [r(1)], [r(1), r(4)])).toBeNull();
+    expect(targetAfterMove(t(1), [r(1)], [r(4), r(5)])).toBeNull();
+    // One piece, under a new id: that piece.
+    expect(targetAfterMove(t(1), [r(1)], [r(4)])).toEqual(t(4));
+    // Nothing split: the target stays.
+    expect(targetAfterMove(t(1), [r(1)], [r(1)])).toEqual(t(1));
+    // A target that was not among what moved, or not a region, is left alone.
+    expect(targetAfterMove(t(2), [r(1)], [r(4), r(5)])).toEqual(t(2));
+    expect(targetAfterMove({ kind: "face", object: 3, face: 2 }, [r(1)], [r(4), r(5)])).toEqual({ kind: "face", object: 3, face: 2 });
+    expect(targetAfterMove(null, [r(1)], [r(4), r(5)])).toBeNull();
+  });
+
+  it("#7 (lane 43): a region lifted to another sketch targets what it became there: the one region, or none", () => {
+    const r = (sketch: number, region: number): Entity => ({ kind: "region", sketch, region });
+    const t = (sketch: number, region: number) => ({ kind: "region" as const, sketch, region });
+    const lifted = new Map([[1, 5]]);
+    // Lifted whole onto an empty plane: the region it is there.
+    expect(targetAfterMove(t(1, 1), [r(1, 1)], [r(5, 9)], lifted)).toEqual(t(5, 9));
+    // Lifted across a shape there: two pieces, so nothing (not the cut shape's remainder).
+    expect(targetAfterMove(t(1, 1), [r(1, 1)], [r(5, 9), r(5, 10)], lifted)).toBeNull();
+    // A target that did not move stays, lifted or not.
+    expect(targetAfterMove(t(5, 2), [r(1, 1)], [r(5, 9)], lifted)).toEqual(t(5, 2));
+    // In its own plane the map changes nothing.
+    expect(targetAfterMove(t(1, 1), [r(1, 1)], [r(1, 1)], new Map([[1, 1]]))).toEqual(t(1, 1));
+  });
+
+  /** #8: `n` edges of a sketch as separate unit squares in a row, every point moving. */
+  function squares(n: number, moving: (p: V3) => boolean = () => true): { mesh: MeshData; subject: Subject } {
+    const flat: number[] = [];
+    const segs: [V3, V3][] = [];
+    const pts: V3[] = [];
+    for (let i = 0; i < n / 4; i++) {
+      const x = i * 2;
+      const sq: V3[] = [[x, 0, 0], [x + 1, 0, 0], [x + 1, 1, 0], [x, 1, 0]];
+      for (let k = 0; k < 4; k++) {
+        const a = sq[k];
+        const b = sq[(k + 1) % 4];
+        flat.push(...a, ...b);
+        segs.push([a, b]);
+      }
+      pts.push(...sq);
+    }
+    const mesh = { positions: new Float32Array(), indices: new Uint32Array(), faceIds: new Uint32Array(), edges: new Float32Array(flat), edgeOwner: new Uint32Array(segs.length), edgeOwners: [{ kind: "sketch", id: 1 }], parts: [] } as MeshData;
+    const subject: Subject = { kind: "objects", objects: [], sketches: [{ sketch: 1, points: pts.filter(moving), edges: [], regions: [], rings: [], origin: [0, 0, 0], normal: [0, 0, 1], moving: pts.filter(moving) }] };
+    return { mesh, subject };
+  }
+
+  /** How much longer `big` takes than `small`: one warm-up of each, then the fastest of
+   * nine runs of each, taken in turn so a burst of load from elsewhere hits both. */
+  function slower(small: () => void, big: () => void): number {
+    small();
+    big();
+    let [s, b] = [Infinity, Infinity];
+    for (let k = 0; k < 9; k++) {
+      let t = performance.now();
+      small();
+      s = Math.min(s, performance.now() - t);
+      t = performance.now();
+      big();
+      b = Math.min(b, performance.now() - t);
+    }
+    return b / Math.max(0.05, s);
+  }
+
+  it("#8: the Move preview's cost grows in step with the sketch's edges, not with edges times moving points", () => {
+    const small = squares(1000);
+    const big = squares(8000);
+    const pvSmall = sketchPreviews(small.subject, small.mesh);
+    const pvBig = sketchPreviews(big.subject, big.mesh);
+    // Eight times the edges: about eight times the work in step, sixty-four times when every
+    // edge is checked against every moving point (as before #8: 21 ms a frame at 1,000 edges,
+    // 356 ms at 4,000). The bound sits well between the two, so load on the machine does not
+    // make it fail (the #8 verifier saw a 4,000 vs 1,000 bound of 8 fail once under load).
+    const frame = slower(
+      () => sketchSegments(pvSmall, translation([1, 0, 0])),
+      () => sketchSegments(pvBig, translation([1, 0, 0])),
+    );
+    const start = slower(
+      () => sketchPreviews(small.subject, small.mesh),
+      () => sketchPreviews(big.subject, big.mesh),
+    );
+    expect(frame, "each frame").toBeLessThan(24);
+    expect(start, "the start of the drag").toBeLessThan(24);
+  });
+
+  it("#8: the preview is the same edges, with the same ends moved, as checking each end against every moving point", () => {
+    // Every third point moves: some edges move whole, some at one end, some not at all.
+    let k = 0;
+    const { mesh, subject } = squares(400, () => k++ % 3 === 0);
+    const part = subject.sketches![0];
+    const near = (p: V3, q: V3) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]) <= 1e-6;
+    const moves = (p: V3) => part.moving.some((q) => near(p, q));
+    const d: V3 = [0.25, 0.5, 0];
+    const want: V3[] = [];
+    const wantCopy: V3[] = [];
+    for (let i = 0; i < mesh.edges.length; i += 6) {
+      const a: V3 = [mesh.edges[i], mesh.edges[i + 1], mesh.edges[i + 2]];
+      const b: V3 = [mesh.edges[i + 3], mesh.edges[i + 4], mesh.edges[i + 5]];
+      if (!moves(a) && !moves(b)) continue;
+      const go = (p: V3): V3 => (moves(p) ? [p[0] + d[0], p[1] + d[1], p[2] + d[2]] : p);
+      want.push(go(a), go(b));
+      if (moves(a) && moves(b)) wantCopy.push(go(a), go(b));
+    }
+    const pv = sketchPreviews(subject, mesh);
+    const got = sketchSegments(pv, translation(d));
+    expect(got.length).toBe(want.length);
+    got.forEach((p, i) => close(p, want[i]));
+    const copied = sketchSegments(pv, translation(d), true);
+    expect(copied.length).toBe(wantCopy.length);
+    copied.forEach((p, i) => close(p, wantCopy[i]));
+  });
+
+  it("#8: each moving point keeps its own tolerance in the lookup, and one that is not finite is checked as before", () => {
+    // A point 10 km out has a tolerance of about 4 mm, so the lookup's cells are about 8 mm
+    // wide; a point at a quarter metre has about 2 micrometres, and keeps it.
+    const far: V3 = [1e4, 0, 0];
+    const small: V3 = [0.25, 0.25, 0];
+    const f = (x: number, y: number): V3 => [Math.fround(x), Math.fround(y), 0];
+    const ends: [V3, V3][] = [
+      [f(0.25 + 3e-6, 0.25), f(0.5, 0.5)], // 3 micrometres from the small point: stays
+      [f(0.25 + 1.5e-6, 0.25), f(0.5, 0.6)], // 1.5 micrometres: moves
+      [f(1e4 + 3e-3, 0), f(1e4 + 1, 1)], // 2.9 mm from the far point, inside its 4 mm: moves
+      [f(1e4 + 5e-3, 0), f(1e4 + 1, 2)], // 4.9 mm: stays
+    ];
+    const mesh = { positions: new Float32Array(), indices: new Uint32Array(), faceIds: new Uint32Array(), edges: new Float32Array(ends.flatMap(([a, b]) => [...a, ...b])), edgeOwner: new Uint32Array(ends.length), edgeOwners: [{ kind: "sketch", id: 1 }], parts: [] } as MeshData;
+    const subject = (moving: V3[]): Subject => ({ kind: "objects", objects: [], sketches: [{ sketch: 1, points: moving, edges: [], regions: [], rings: [], origin: [0, 0, 0], normal: [0, 0, 1], moving }] });
+    const d: V3 = [0, 0.5, 0];
+    const pv = sketchPreviews(subject([far, small]), mesh);
+    expect(pv[0].edges).toEqual([ends[1], ends[2]]);
+    expect(pv[0].moves).toEqual([
+      [true, false],
+      [true, false],
+    ]);
+    // A moving point with an infinite or undefined coordinate gives the same preview as
+    // checking every moving point (an infinite one is near everything, as it was).
+    const scanMoves = (moving: V3[]) => (p: V3) => moving.some((q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]) <= 2e-6 + 4e-7 * Math.max(Math.abs(q[0]), Math.abs(q[1]), Math.abs(q[2])));
+    for (const odd of [[Infinity, 0, 0], [0, NaN, 0], [-Infinity, -Infinity, 0]] as V3[]) {
+      const moving = [far, small, odd];
+      const moves = scanMoves(moving);
+      const want = ends.filter(([a, b]) => moves(a) || moves(b));
+      const got = sketchPreviews(subject(moving), mesh);
+      expect(got[0].edges, String(odd)).toEqual(want);
+      const segs = sketchSegments(got, translation(d));
+      expect(segs, String(odd)).toEqual(want.flatMap(([a, b]) => [a, b].map((p) => (moves(p) ? applyX(translation(d), p) : p))));
+    }
+  });
+
+  it("#8: over 400 seeded random sketches, the preview is what checking every point gives", () => {
+    // The lookup against the scan it replaced, written out here. Sketches from 1 mm to 10 km
+    // across, a third with a point 10 km out (so the points' tolerances differ a thousandfold
+    // and the cells are far wider than most of them), points off the plane and below zero,
+    // ends at fractions and multiples of a point's tolerance in every direction, rings,
+    // carried edges either way round, and points selected on their own.
+    const tol = (q: V3) => 2e-6 + 4e-7 * Math.max(Math.abs(q[0]), Math.abs(q[1]), Math.abs(q[2]));
+    const near = (p: V3, q: V3) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]) <= tol(q);
+    let seed = 12345;
+    const rnd = () => {
+      seed = (seed + 0x6d2b79f5) >>> 0;
+      let t = seed;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = <T,>(a: T[]): T => a[Math.floor(rnd() * a.length)];
+    const f32 = (p: V3): V3 => [Math.fround(p[0]), Math.fround(p[1]), Math.fround(p[2])];
+    // A copy of `p`, or one moved by a fraction or a multiple of its tolerance in a random direction.
+    const nudge = (p: V3): V3 => {
+      if (rnd() < 0.3) return [p[0], p[1], p[2]];
+      const d: V3 = [rnd() - 0.5, rnd() - 0.5, rnd() - 0.5];
+      const f = pick([0, 0.25, 0.5, 0.999, 1, 1.0001, 1.5, 2, 3]) * tol(p) / (Math.hypot(...d) || 1);
+      return [p[0] + d[0] * f, p[1] + d[1] * f, p[2] + d[2] * f];
+    };
+    const seen = { edges: 0, oneEnd: 0, lift: 0, stay: 0, lone: 0 };
+    const maps = [translation([0.5, 0, 0]), translation([0, 0, 0.25]), rotation([0, 0, 0], [0, 0, 1], 0.7), rotation([0, 0, 0], [1, 0, 0], Math.PI / 2, 90), scaling([0, 0, 0], [2, 2, 2])];
+    for (let c = 0; c < 400; c++) {
+      const step = pick([1e-3, 1, 10, 1e4]) / 5;
+      const base: V3[] = Array.from({ length: 2 + Math.floor(rnd() * 14) }, () => [Math.floor(rnd() * 5 - 2) * step, Math.floor(rnd() * 5 - 2) * step, rnd() < 0.5 ? 0 : Math.floor(rnd() * 5 - 2) * step]);
+      if (rnd() < 0.3) base.push(pick<V3>([[1e4, 0, 0], [-1e4, 0, 0], [0, -1e4, 0], [0, 0, 1e4]]));
+      const all: [V3, V3][] = Array.from({ length: 1 + Math.floor(rnd() * 20) }, () => [f32(nudge(pick(base))), f32(nudge(pick(base)))]);
+      const mesh = { positions: new Float32Array(), indices: new Uint32Array(), faceIds: new Uint32Array(), edges: new Float32Array(all.flatMap(([a, b]) => [...a, ...b])), edgeOwner: new Uint32Array(all.length), edgeOwners: [{ kind: "sketch", id: 1 }], parts: [] } as MeshData;
+      const anyEnd = () => pick(pick(all));
+      const moving: V3[] = Array.from({ length: 1 + Math.floor(rnd() * 12) }, () => nudge(anyEnd()));
+      const rings: V3[][] = rnd() < 0.5 ? [Array.from({ length: 3 + Math.floor(rnd() * 3) }, () => nudge(anyEnd()))] : [];
+      // A few of the edges selected, or (a quarter of the time) every one of them.
+      const chosen = rnd() < 0.25 ? all : Array.from({ length: Math.floor(rnd() * 4) }, () => pick(all));
+      const carried = chosen.map((e): [V3, V3] => {
+        const [a, b] = e.map(nudge);
+        return rnd() < 0.5 ? [a, b] : [b, a];
+      });
+      const points = rnd() < 0.4 ? moving.filter(() => rnd() < 0.3) : [];
+      const part = { sketch: 1, points, edges: carried, regions: rings.length ? [1] : [], rings, origin: [0, 0, 0] as V3, normal: [0, 0, 1] as V3, moving };
+      const subject: Subject = { kind: "objects", objects: [], sketches: [part] };
+      // The scan: both ends of every edge against every moving point, each with its own tolerance.
+      const mv = (p: V3) => moving.some((q) => near(p, q));
+      const keep = all.filter(([a, b]) => mv(a) || mv(b));
+      const ends = keep.map(([a, b]): [boolean, boolean] => [mv(a), mv(b)]);
+      const ringPts = rings.flat();
+      const ringEdges = rings.flatMap((r) => r.map((p, i): [V3, V3] => [p, r[(i + 1) % r.length]]));
+      const same = ([a, b]: [V3, V3], [x, y]: [V3, V3]) => (near(a, x) && near(b, y)) || (near(a, y) && near(b, x));
+      const isCarried = (e: [V3, V3]) => [...carried, ...ringEdges].some((x) => same(e, x));
+      const onRing = (p: V3) => ringPts.some((q) => near(p, q));
+      const lone = points.some((p) => ![...carried.flat(), ...ringPts].some((q) => near(p, q)));
+      const lift = !lone && (carried.length > 0 || part.regions.length > 0) && keep.every((e, i) => isCarried(e) || e.every((p, k) => !ends[i][k] || onRing(p)));
+      const [pv] = sketchPreviews(subject, mesh);
+      expect(pv.edges, `case ${c}: edges`).toEqual(keep);
+      expect(pv.moves, `case ${c}: ends`).toEqual(ends);
+      expect(pv.liftable, `case ${c}: liftable`).toBe(lift);
+      for (const x of maps) {
+        const map = sketchPointMap(part, lift, x);
+        const plain = keep.flatMap(([a, b], i) => [ends[i][0] ? map(a) : a, ends[i][1] ? map(b) : b]);
+        const copy = keep.flatMap(([a, b], i) => (ends[i][0] && ends[i][1] ? [map(a), map(b)] : []));
+        expect(sketchSegments([pv], x), `case ${c}`).toEqual(plain);
+        expect(sketchSegments([pv], x, true), `case ${c}: copy`).toEqual(copy);
+        // A preview made without the recorded ends works them out the same way.
+        expect(sketchSegments([{ ...pv, moves: undefined }], x), `case ${c}: by hand`).toEqual(plain);
+      }
+      seen.edges += keep.length;
+      seen.oneEnd += ends.filter(([a, b]) => a !== b).length;
+      seen[lift ? "lift" : "stay"]++;
+      if (lone) seen.lone++;
+    }
+    // Every kind of case came up often enough to count (2,170 edges kept, 1,496 with one end
+    // moving, 55 sketches that may leave their plane, 345 that may not, 115 with a lone point).
+    expect(seen.edges).toBeGreaterThan(2000);
+    expect(seen.oneEnd).toBeGreaterThan(300);
+    expect(seen.lift).toBeGreaterThan(40);
+    expect(seen.stay).toBeGreaterThan(40);
+    expect(seen.lone).toBeGreaterThan(10);
   });
 
   it("the preview moves whole solids, or only the moving ends of part of one", () => {
@@ -276,11 +546,56 @@ describe("Move tool", () => {
     close((op.xform as { translation: V3 }).translation, [36 * IN, 0, 0]);
     expect(h.statuses.at(-1)?.text).toMatch(/^Moved .* 36 in along \+red/);
     expect(h.sel).toEqual([region]);
+    // Lane 43 (#7): the host is told what was selected before the step and what after it,
+    // so Undo and Redo of it select those again.
+    expect(h.remembered).toEqual([{ before: [region], after: [region], target: null }]);
     // Typed again after the move: undo and move again from where it was.
     t.onValue("12");
     await tick();
     expect(ops(h).slice(-2)).toMatchObject([{ op: "undo" }, { op: "transform_sketch", regions: [1] }]);
     close((ops(h).at(-1)!.xform as { translation: V3 }).translation, [12 * IN, 0, 0]);
+    expect(h.remembered).toHaveLength(2);
+    expect(h.remembered[1].before).toEqual([region]);
+  });
+
+  it("#7 (lane 43): a region lifted across a shape on another plane leaves Push/Pull no target, not the cut shape's remainder", async () => {
+    // The kernel says the lifted square's edges bound regions 9 and 10 of sketch 5 there: two
+    // pieces (the app's nextTarget, run here as the app runs it, names the first).
+    const h = fakeHost({ outcome: { kind: "sketch_moved", sketch: 5, regions: [[5, 9], [5, 10]] } });
+    const apply = h.apply;
+    h.apply = async (op, describe) => {
+      const r = await apply(op, describe);
+      if (r) h._target = nextTarget(op, r.outcome, h._target);
+      return r;
+    };
+    const region: Entity = { kind: "region", sketch: 1, region: 1 };
+    h.sel = [region];
+    h._target = { kind: "region", sketch: 1, region: 1 };
+    const t = new MoveTool(h);
+    t.onEvent(ev("down", [0, 0, 0], { snapKind: "endpoint" }));
+    await tick();
+    t.onEvent(ev("click", [0, 0, 0], { snapKind: "endpoint" }));
+    t.onEvent(ev("move", [0, 0, 0.3], { snapKind: "axis-z" }));
+    t.onValue("6");
+    await tick();
+    expect(ops(h).at(-1)).toMatchObject({ op: "transform_sketch", sketch: 1, regions: [1] });
+    expect(h.sel).toEqual([
+      { kind: "region", sketch: 5, region: 9 },
+      { kind: "region", sketch: 5, region: 10 },
+    ]);
+    expect(h._target).toBeNull();
+    // Lifted whole onto an empty plane (one region there): that region is the target.
+    h.outcome = { kind: "sketch_moved", sketch: 6, regions: [[6, 1]] };
+    h.sel = [region];
+    h._target = { kind: "region", sketch: 1, region: 1 };
+    const t2 = new MoveTool(h);
+    t2.onEvent(ev("down", [0, 0, 0], { snapKind: "endpoint" }));
+    await tick();
+    t2.onEvent(ev("click", [0, 0, 0], { snapKind: "endpoint" }));
+    t2.onEvent(ev("move", [0, 0, 0.3], { snapKind: "axis-z" }));
+    t2.onValue("6");
+    await tick();
+    expect(h._target).toEqual({ kind: "region", sketch: 6, region: 1 });
   });
 
   it("names regions of two sketches with their sketches, and of one sketch without (lane 27, #10)", async () => {
@@ -363,5 +678,272 @@ describe("Move tool", () => {
     await tick();
     expect(ops(h).at(-1)).toMatchObject({ op: "transform_sketch", points: [[1, 1, 0]] });
     expect(h.sel).toEqual([{ ...corner, at: [1.5, 1.25, 0] }]);
+  });
+});
+
+const pkg = path.resolve(__dirname, "../wasm/pkg");
+const built = existsSync(path.join(pkg, "sawhorse_wasm_bg.wasm"));
+const runKernel = built || process.env.REQUIRE_KERNEL ? describe : describe.skip;
+
+// #7 through the real kernel (needs `npm run wasm`): what is selected after a split is the
+// moved shape's pieces, read back by area, for a turn, a mirror and a region with a hole.
+runKernel("#7 through the kernel: a split shape is selected as its pieces", () => {
+  async function doc(): Promise<WasmDoc> {
+    const mod = (await import(/* @vite-ignore */ path.join(pkg, "sawhorse_wasm.js"))) as { initSync(o: { module: Buffer }): void; document_new(): WasmDoc };
+    mod.initSync({ module: readFileSync(path.join(pkg, "sawhorse_wasm_bg.wasm")) });
+    return mod.document_new();
+  }
+  function meshOf(d: WasmDoc): MeshData {
+    const m = d.get_scene_mesh();
+    const mesh = { positions: m.positions(), indices: m.indices(), faceIds: m.face_ids(), edges: m.edges(), edgeOwner: m.edge_owner(), edgeOwners: JSON.parse(m.edge_owners_json()), parts: JSON.parse(m.parts_json()) };
+    m.free();
+    return mesh;
+  }
+  const apply = (d: WasmDoc, op: unknown): OpOutcome => {
+    const out = JSON.parse(d.apply_op(JSON.stringify(op)));
+    expect(out.error, JSON.stringify(out)).toBeUndefined();
+    return out;
+  };
+  const draw = (d: WasmDoc, pts: [number, number][]) => apply(d, { op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: pts.map(([x, y]) => [x, y, 0]), closed: true });
+  const rect = (d: WasmDoc, x: number, y: number, w: number, h: number) => draw(d, [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]);
+  /** Each region's area in the view mesh, by id. */
+  function areas(mesh: MeshData): Map<number, number> {
+    const out = new Map<number, number>();
+    for (let t = 0; t < mesh.faceIds.length; t++) {
+      const part = mesh.parts[mesh.faceIds[t]];
+      if (part.kind !== "region") continue;
+      const [a, b, c] = [0, 1, 2].map((k) => Array.from(mesh.positions.subarray(mesh.indices[t * 3 + k] * 3, mesh.indices[t * 3 + k] * 3 + 3)));
+      const area = Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2;
+      out.set(part.index, (out.get(part.index) ?? 0) + area);
+    }
+    return out;
+  }
+  const regionOfArea = (d: WasmDoc, area: number): Entity => {
+    const hit = [...areas(meshOf(d))].find(([, a]) => Math.abs(a - area) < 1e-6);
+    expect(hit, `a region of area ${area}`).toBeDefined();
+    return { kind: "region", sketch: 1, region: hit![0] };
+  };
+  /** Run the gesture the tools run: outlines, subject, previews, the op, then movedSelection. */
+  async function moved(d: WasmDoc, sel: Entity[], x: Xform, op: (s: Subject) => KernelOp) {
+    const outlines = await loadOutlines(async (t) => JSON.parse(d.outline(t.kind, (t as { sketch: number }).sketch, (t as { region: number }).region)), sel);
+    const s = subjectOf(sel, null, outlines, JSON.parse(d.state_json()) as DocState) as Subject;
+    const pv = sketchPreviews(s, meshOf(d));
+    const outcome = apply(d, op(s));
+    const mesh = meshOf(d);
+    const next = movedSelection(sel, s, pv, x, outcome, mesh);
+    const all = areas(mesh);
+    const ids = next.map((e) => (e.kind === "region" ? e.region : -1));
+    // Every selected id is a live region, each once.
+    expect(ids.every((r) => all.has(r))).toBe(true);
+    expect(new Set(ids).size).toBe(ids.length);
+    return { ids, area: ids.reduce((a, r) => a + all.get(r)!, 0), all };
+  }
+
+  it("Rotate: a bar turned 180 degrees across a square's edge is its two halves; the square's remainder is not selected", async () => {
+    const d = await doc();
+    rect(d, 0, 0, 2, 2);
+    rect(d, 4, 0.5, 2, 1);
+    const bar = regionOfArea(d, 2);
+    const x = rotation([3.5, 1, 0], [0, 0, 1], Math.PI, 180);
+    const r = await moved(d, [bar], x, (s) => rotateOp(s, [3.5, 1, 0], [0, 0, 1], Math.PI, false, 1, 180));
+    expect(r.ids).toHaveLength(2);
+    expect(r.area).toBeCloseTo(2, 5);
+    // The square's remainder (3 of its 4) stays unselected.
+    const rest = [...r.all].find(([, a]) => Math.abs(a - 3) < 1e-6)!;
+    expect(r.ids).not.toContain(rest[0]);
+    d.free();
+  });
+
+  it("Scale: a triangle mirrored across a square's edge is both its pieces", async () => {
+    const d = await doc();
+    rect(d, 0, 0, 2, 2);
+    draw(d, [[2.5, 0.5], [4, 0.5], [2.5, 1.5]]);
+    const tri = regionOfArea(d, 0.75);
+    const r = await moved(d, [tri], scaling([2.6, 0, 0], [-1, 1, 1]), (s) => scaleOp(s, [2.6, 0, 0], [-1, 1, 1]));
+    expect(r.ids).toHaveLength(2);
+    expect(r.area).toBeCloseTo(0.75, 5);
+    d.free();
+  });
+
+  it("Move: a region with a hole moved across a square is its pieces; its island and the square's remainder are not selected", async () => {
+    const d = await doc();
+    rect(d, 0, 0, 4, 4);
+    rect(d, 10, 0, 6, 6);
+    rect(d, 12, 2, 2, 1);
+    // The 6 x 6 square less its 2 x 1 island: 34. Moved so it overlaps the 4 x 4 square.
+    const ring = regionOfArea(d, 34);
+    const r = await moved(d, [ring], translation([-7, -1, 0]), (s) => moveOp(s, [-7, -1, 0], false));
+    expect(r.ids).toHaveLength(2);
+    expect(r.area).toBeCloseTo(34, 5);
+    // Its pieces are 4 (over the square) and 30. Not selected: the island (2, moved along
+    // with its hole) and the square's remainder (12).
+    expect(r.ids.map((id) => Math.round(r.all.get(id)!)).sort((a, b) => a - b)).toEqual([4, 30]);
+    expect([...r.all.values()].map(Math.round).sort((a, b) => a - b)).toEqual([2, 4, 12, 30]);
+    d.free();
+  });
+});
+
+// Lane 43 (#7): the cases lane 41 left, through the real kernel. Each reads the selection the
+// tools' own steps make and checks every entity in it against the new view mesh: a region or
+// a curve the mesh does not draw names nothing.
+runKernel("#7 through the kernel: a rim that splits, a merge and a lift", () => {
+  async function doc(): Promise<WasmDoc> {
+    const mod = (await import(/* @vite-ignore */ path.join(pkg, "sawhorse_wasm.js"))) as { initSync(o: { module: Buffer }): void; document_new(): WasmDoc };
+    mod.initSync({ module: readFileSync(path.join(pkg, "sawhorse_wasm_bg.wasm")) });
+    return mod.document_new();
+  }
+  function meshOf(d: WasmDoc): MeshData {
+    const m = d.get_scene_mesh();
+    const mesh: MeshData = {
+      positions: m.positions(),
+      indices: m.indices(),
+      faceIds: m.face_ids(),
+      edges: m.edges(),
+      edgeOwner: m.edge_owner(),
+      edgeOwners: JSON.parse(m.edge_owners_json()),
+      parts: JSON.parse(m.parts_json()),
+      edgeCurve: m.edge_curves(),
+      curves: JSON.parse(m.curves_json()),
+    };
+    m.free();
+    return mesh;
+  }
+  const apply = (d: WasmDoc, op: unknown): OpOutcome => {
+    const out = JSON.parse(d.apply_op(JSON.stringify(op)));
+    expect(out.error, JSON.stringify(out)).toBeUndefined();
+    return out;
+  };
+  const plane = (z: number) => ({ on: "plane", origin: [0, 0, z], normal: [0, 0, 1] });
+  /** A closed stroke at height `z`; the region it made (the last the kernel names). */
+  const draw = (d: WasmDoc, pts: [number, number][], z = 0): Entity => {
+    const out = apply(d, { op: "draw", target: plane(z), points: pts.map(([x, y]) => [x, y, z]), closed: true }) as Extract<OpOutcome, { kind: "drawn" }>;
+    expect(out.sketch).not.toBeNull();
+    return { kind: "region", sketch: out.sketch!, region: out.regions.at(-1)! };
+  };
+  const rect = (d: WasmDoc, x: number, y: number, w: number, h: number, z = 0) => draw(d, [[x, y], [x + w, y], [x + w, y + h], [x, y + h]], z);
+  /** A circle of 24 segments on the ground, as the Circle tool draws it: one curve. */
+  const circle = (d: WasmDoc, c: [number, number], r: number): Entity => {
+    const pts = Array.from({ length: 24 }, (_, k) => [c[0] + r * Math.cos((k * Math.PI) / 12), c[1] + r * Math.sin((k * Math.PI) / 12), 0]);
+    const out = apply(d, { op: "draw", target: plane(0), points: pts, closed: true, curve: { kind: "circle", centre: [c[0], c[1], 0] } }) as Extract<OpOutcome, { kind: "drawn" }>;
+    expect(out.curve).toBeDefined();
+    return { kind: "curve", owner: { kind: "sketch", id: out.sketch! }, curve: out.curve! };
+  };
+  /** Each region's area in the view mesh, keyed `sketch:region`. */
+  function areas(mesh: MeshData): Map<string, number> {
+    const out = new Map<string, number>();
+    for (let t = 0; t < mesh.faceIds.length; t++) {
+      const part = mesh.parts[mesh.faceIds[t]];
+      if (part.kind !== "region") continue;
+      const [a, b, c] = [0, 1, 2].map((k) => Array.from(mesh.positions.subarray(mesh.indices[t * 3 + k] * 3, mesh.indices[t * 3 + k] * 3 + 3)));
+      const area = Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2;
+      const key = `${part.owner}:${part.index}`;
+      out.set(key, (out.get(key) ?? 0) + area);
+    }
+    return out;
+  }
+  const key = (e: Entity) => (e.kind === "region" ? `${e.sketch}:${e.region}` : e.kind === "curve" ? `c${e.owner.id}:${e.curve}` : JSON.stringify(e));
+  /** Run the gesture the tools run (outlines, subject, previews, the op, movedSelection) and
+   * check that everything it selects is drawn in the new mesh, each once. */
+  async function moved(d: WasmDoc, sel: Entity[], x: Xform, op: (s: Subject) => KernelOp) {
+    const outlines = await loadOutlines(async (t) => {
+      const [owner, index] = t.kind === "region" ? [t.sketch, t.region] : t.kind === "curve" ? [t.sketch, t.curve] : [0, 0];
+      return JSON.parse(d.outline(t.kind, owner, index));
+    }, sel);
+    const s = subjectOf(sel, null, outlines, JSON.parse(d.state_json()) as DocState) as Subject;
+    const pv = sketchPreviews(s, meshOf(d));
+    const kop = op(s);
+    const outcome = apply(d, kop);
+    const mesh = meshOf(d);
+    const next = movedSelection(sel, s, pv, x, outcome, mesh);
+    const all = areas(mesh);
+    const curves = new Set((mesh.curves ?? []).filter((c) => c.owner.kind === "sketch").map((c) => `c${c.owner.id}:${c.curve}`));
+    const keys = next.map(key);
+    for (const k of keys) expect(all.has(k) || curves.has(k), `${k} is drawn`).toBe(true);
+    expect(new Set(keys).size).toBe(keys.length);
+    return { next, keys, op: kop, outcome, mesh, all, curves, subject: s, area: keys.reduce((a, k) => a + (all.get(k) ?? 0), 0) };
+  }
+
+  it("a circle's rim selected on its own and moved across a rectangle's edge is every arc it became", async () => {
+    const d = await doc();
+    rect(d, 0, 0, 4, 2);
+    const rim = circle(d, [7, 1], 0.5);
+    // Its centre lands on the rectangle's right edge: the rim crosses it twice.
+    const r = await moved(d, [rim], translation([-3, 0, 0]), (s) => moveOp(s, [-3, 0, 0], false));
+    // The rim is two arcs now, and the selection is both of them.
+    expect([...r.curves]).toHaveLength(2);
+    expect(r.keys.sort()).toEqual([...r.curves].sort());
+    expect(r.next.every((e) => e.kind === "curve")).toBe(true);
+    d.free();
+  });
+
+  it("a circle's rim moved exactly onto an identical circle is never selected as an id that names nothing", async () => {
+    // The older of two curves on the same edges keeps them (ADR-0013): a newer rim moved onto
+    // an older circle goes, and nothing is selected for it; an older rim moved onto a newer
+    // circle keeps its id and stays selected.
+    const d = await doc();
+    circle(d, [1, 1], 0.5);
+    const newer = circle(d, [4, 1], 0.5);
+    const a = await moved(d, [newer], translation([-3, 0, 0]), (s) => moveOp(s, [-3, 0, 0], false));
+    expect([...a.curves]).toEqual(["c1:1"]);
+    expect(a.keys).toEqual([]);
+    d.free();
+    const e = await doc();
+    const older = circle(e, [4, 1], 0.5);
+    circle(e, [1, 1], 0.5);
+    const b = await moved(e, [older], translation([-3, 0, 0]), (s) => moveOp(s, [-3, 0, 0], false));
+    expect([...b.curves]).toEqual([key(older)]);
+    expect(b.keys).toEqual([key(older)]);
+    e.free();
+  });
+
+  it("a circle's rim lifted onto another plane across a rectangle's edge there is every arc it became there", async () => {
+    const d = await doc();
+    rect(d, 0, 0, 4, 2, 1);
+    const rim = circle(d, [7, 1], 0.5);
+    const r = await moved(d, [rim], translation([-3, 0, 1]), (s) => moveOp(s, [-3, 0, 1], false));
+    const up = (r.outcome as Extract<OpOutcome, { kind: "sketch_moved" }>).sketch;
+    expect([...r.curves].every((k) => k.startsWith(`c${up}:`))).toBe(true);
+    expect([...r.curves]).toHaveLength(2);
+    expect(r.keys.sort()).toEqual([...r.curves].sort());
+    d.free();
+  });
+
+  it("a shape moved exactly onto an identical one is selected as the region there, never an id that names nothing", async () => {
+    const d = await doc();
+    const stays = rect(d, 0, 0, 1, 1);
+    const goes = rect(d, 3, 0, 1, 1);
+    const r = await moved(d, [goes], translation([-3, 0, 0]), (s) => moveOp(s, [-3, 0, 0], false));
+    // The two merge: one region of area 1 is left, and it is what is selected.
+    expect([...r.all.values()]).toHaveLength(1);
+    expect(r.keys).toEqual([...r.all.keys()]);
+    expect(r.area).toBeCloseTo(1, 6);
+    // The moved square's own id is gone (the region that stays keeps its id).
+    expect(r.all.has(key(goes))).toBe(false);
+    expect(r.all.has(key(stays))).toBe(true);
+    d.free();
+  });
+
+  it("a shape lifted onto another sketch's plane where it cuts a shape is selected as its own pieces only", async () => {
+    const d = await doc();
+    // A 2 x 2 square up at z = 1, and a 2 x 1 bar on the ground beside it.
+    const up = rect(d, 0, 0, 2, 2, 1);
+    const bar = rect(d, 3, 0.5, 2, 1);
+    expect(bar.kind === "region" && up.kind === "region" && bar.sketch !== up.sketch).toBe(true);
+    // Lifted 1 up and 2 to the left: half of it lands over the square's right edge.
+    const r = await moved(d, [bar], translation([-2, 0, 1]), (s) => moveOp(s, [-2, 0, 1], false));
+    const upSketch = (up as Extract<Entity, { kind: "region" }>).sketch;
+    expect(r.next.every((e) => e.kind === "region" && e.sketch === upSketch)).toBe(true);
+    // Its two halves (1 each), not the square's remainder (3).
+    expect(r.keys.map((k) => Math.round(r.all.get(k)!))).toEqual([1, 1]);
+    expect(r.area).toBeCloseTo(2, 6);
+    // Push/Pull's target (the bar, before the lift) follows: two pieces, so none. The target
+    // the app gave a lifted region (nextTarget: the first region its edges bound there) is
+    // the square's remainder here, and the tools used to keep it.
+    const b = bar as Extract<Entity, { kind: "region" }>;
+    const was = { kind: "region" as const, sketch: b.sketch, region: b.region };
+    const given = nextTarget(r.op, r.outcome, was);
+    expect(given?.kind === "region" && Math.round(r.all.get(`${given.sketch}:${given.region}`)!)).toBe(3);
+    expect(targetAfterMove(was, [bar], r.next, sketchesAfter(r.subject, r.outcome))).toBeNull();
+    d.free();
   });
 });

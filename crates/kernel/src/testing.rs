@@ -555,7 +555,9 @@ pub fn check_nesting_of(
     n: &crate::nesting::Nesting,
 ) -> Result<(), String> {
     use crate::cutlist::Grain;
-    use crate::nesting::{CutDir, EPS, UnplacedReason, effective_trim};
+    use crate::nesting::{
+        CutDir, EPS, MAX_GLUE_STRIPS, MIN_GLUE_FILLER, UnplacedReason, effective_trim,
+    };
     use crate::stock::{
         NestAlgorithm, SHEET_THICKNESS_SLACK, STOCK_EPSILON, StockGrain, StockKind,
     };
@@ -578,6 +580,10 @@ pub fn check_nesting_of(
         }
     }
     let mut seen = BTreeSet::new();
+    // #49: the strips of each glued part, (row, copy) -> (strip, of, width, piece's stock).
+    type Strips = Vec<(usize, usize, f64, String)>;
+    let mut strips: std::collections::BTreeMap<(usize, usize), Strips> =
+        std::collections::BTreeMap::new();
     let kerf = n.settings.kerf;
     let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
     let mut placed = 0;
@@ -595,7 +601,22 @@ pub fn check_nesting_of(
                 .rows
                 .get(q.row)
                 .ok_or_else(|| format!("piece {}: no row {}", p.index, q.row))?;
-            if !seen.insert((q.row, q.copy)) {
+            if let Some(st) = q.strip {
+                // A strip: the part's length along the board, a strip's width across it.
+                if p.kind != StockKind::Board || row.sheet {
+                    return bad(format!("{} is a strip off a sheet", q.tag));
+                }
+                // A strip has a width: positive, and not NaN.
+                if q.turned || q.dx != row.size[2] || q.dy.is_nan() || q.dy <= 0.0 {
+                    return bad(format!("{} is not a strip of its part", q.tag));
+                }
+                strips.entry((q.row, q.copy)).or_default().push((
+                    st.n,
+                    st.of,
+                    q.dy,
+                    p.stock.clone(),
+                ));
+            } else if !seen.insert((q.row, q.copy)) {
                 return bad(format!("{} placed twice", q.tag));
             }
             if row.uncounted.is_some() {
@@ -605,7 +626,9 @@ pub fn check_nesting_of(
                 return bad(format!("{} is not its row's piece", q.tag));
             }
             let (w, l) = (row.size[1], row.size[2]);
-            let dims_ok = if q.turned {
+            let dims_ok = if q.strip.is_some() {
+                true
+            } else if q.turned {
                 q.dx == w && q.dy == l
             } else {
                 q.dx == l && q.dy == w
@@ -680,7 +703,81 @@ pub fn check_nesting_of(
         {
             return bad("a guillotine or board layout does not come apart in straight cuts".into());
         }
-        placed += p.placements.len();
+        placed += p
+            .placements
+            .iter()
+            .filter(|q| q.strip.is_none_or(|s| s.n == 1))
+            .count();
+    }
+    // #49: every glued part is strips 1..=of, each once, all off one stock: full-width
+    // strips of that board and one filler no wider, their widths the part's width plus a
+    // joint loss per joint; and listed among the glue-ups with exactly those widths.
+    let joint = n.settings.joint_loss;
+    for (&(row_i, copy), v) in &mut strips {
+        let row = &list.rows[row_i];
+        v.sort_by_key(|s| s.0);
+        let of = v[0].1;
+        let numbers: Vec<usize> = v.iter().map(|s| s.0).collect();
+        if of < 2 || v.iter().any(|s| s.1 != of) || numbers != (1..=of).collect::<Vec<_>>() {
+            return Err(format!(
+                "part {} {copy}: strips {numbers:?} of {of}",
+                row_i + 1
+            ));
+        }
+        if v.iter().any(|s| s.3 != v[0].3) {
+            return Err(format!(
+                "part {} {copy}: strips off different stock",
+                row_i + 1
+            ));
+        }
+        let board = n
+            .library
+            .find(&v[0].3)
+            .ok_or_else(|| format!("part {} {copy}: strips name a missing stock", row_i + 1))?
+            .1;
+        let full = v[..of - 1].iter().all(|s| close(s.2, board.width));
+        let filler = v[of - 1].2;
+        let total: f64 = v.iter().map(|s| s.2).sum();
+        // Lane 42: never more than MAX_GLUE_STRIPS strips, never a filler narrower than the
+        // kerf or MIN_GLUE_FILLER.
+        if !full
+            || !(filler > joint - EPS && filler <= board.width + EPS)
+            || filler < kerf.max(MIN_GLUE_FILLER) - EPS
+            || of > MAX_GLUE_STRIPS
+            || !close(total, row.size[1] + (of - 1) as f64 * joint)
+            || row.size[1] <= board.width + EPS
+        {
+            return Err(format!(
+                "part {} {copy}: strips {:?} do not glue up to {} on {}",
+                row_i + 1,
+                v.iter().map(|s| s.2).collect::<Vec<_>>(),
+                row.size[1],
+                board.name
+            ));
+        }
+        let listed = n
+            .glue_ups
+            .iter()
+            .filter(|g| g.row == row_i && g.copy == copy)
+            .collect::<Vec<_>>();
+        if listed.len() != 1
+            || listed[0].stock != board.name
+            || listed[0].widths != v.iter().map(|s| s.2).collect::<Vec<_>>()
+        {
+            return Err(format!(
+                "part {} {copy}: glue-up not listed as placed",
+                row_i + 1
+            ));
+        }
+        if !seen.insert((row_i, copy)) {
+            return Err(format!(
+                "part {} {copy}: placed whole and as strips",
+                row_i + 1
+            ));
+        }
+    }
+    if n.glue_ups.len() != strips.len() {
+        return Err("a glue-up is listed with no strips placed".into());
     }
     for u in &n.unplaced {
         let row = list
@@ -729,10 +826,29 @@ pub fn check_nesting_of(
                 holds(l, w)
             };
             let fits_any = holds(l, w) || holds(w, l);
-            let ok = match u.reason {
-                UnplacedReason::TooLarge => !fits_any,
-                _ => fits_any && !fits_allowed,
-            };
+            // #49: a board part too wide but not too long, grain along, is glued up.
+            let joint = n.settings.joint_loss;
+            // Lane 42: and only when the least count that covers it, found by trying each,
+            // is at most MAX_GLUE_STRIPS with a filler no narrower than the kerf or 1 mm.
+            // The fix pass: a part of no length (1 nm or less) is never glued, and each
+            // count's filler is worked out as the kernel works it out, so the two agree to
+            // the last bit on a boundary.
+            let gluable = s.kind == StockKind::Board
+                && !row.sheet
+                && row.grain != Grain::Width
+                && l > EPS
+                && l <= uw + EPS
+                && w > uh + EPS
+                && uh > joint + EPS
+                && (2..=MAX_GLUE_STRIPS)
+                    .map(|k| w + (k - 1) as f64 * joint - (k - 1) as f64 * uh)
+                    .find(|&filler| filler <= uh + EPS)
+                    .is_some_and(|filler| filler >= kerf.max(MIN_GLUE_FILLER) - EPS);
+            let ok = !gluable
+                && match u.reason {
+                    UnplacedReason::TooLarge => !fits_any,
+                    _ => fits_any && !fits_allowed,
+                };
             if !ok {
                 return Err(format!("{} reported {:?} but it is not", u.tag, u.reason));
             }
@@ -1162,8 +1278,88 @@ pub fn check_sequence(ops: &[Op]) -> Result<RunSummary, String> {
             d.hash_hex()
         ));
     }
+    check_saved(&d)?;
     summary.objects = d.model().objects().len();
     Ok(summary)
+}
+
+/// Lane 28: the model, saved as a `.shz` saves it (its snapshot, through JSON as
+/// `scene.json` holds it) and opened again, is the same model: the same hash and the same
+/// ids, and saving what opened writes the same snapshot. Save reads its own file back and
+/// refuses one that differs, so a model this fails on is a model that cannot be saved.
+pub fn check_saved(d: &Document) -> Result<(), String> {
+    let snap = d.model().snapshot();
+    let json = serde_json::to_string(&snap).map_err(|e| format!("save: to JSON: {e}"))?;
+    let back: crate::snapshot::Snapshot =
+        serde_json::from_str(&json).map_err(|e| format!("save: from JSON: {e}"))?;
+    let opened = Document::open(back).map_err(|e| format!("save: the file does not open: {e}"))?;
+    let ids = |m: &Model| {
+        (
+            m.object_ids(),
+            m.nodes().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            m.definitions()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            m.sketches().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            m.meshes().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        )
+    };
+    if ids(opened.model()) != ids(d.model()) {
+        return Err(format!(
+            "save: the file opens with other ids: {:?} vs {:?}",
+            ids(opened.model()),
+            ids(d.model())
+        ));
+    }
+    if opened.hash() != d.hash() {
+        return Err(format!(
+            "save: the file opens as another model: {} vs {}",
+            opened.hash_hex(),
+            d.hash_hex()
+        ));
+    }
+    let again = opened.model().snapshot();
+    if again != snap {
+        return Err(format!(
+            "save: saving the opened file writes another snapshot ({})",
+            json_difference(
+                &serde_json::to_value(&snap).unwrap_or_default(),
+                &serde_json::to_value(&again).unwrap_or_default(),
+                String::new()
+            )
+            .unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+/// Where two JSON values first differ, as a path and the two values (for test messages).
+fn json_difference(a: &serde_json::Value, b: &serde_json::Value, at: String) -> Option<String> {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            let keys: std::collections::BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+            keys.into_iter().find_map(|k| {
+                let n = Value::Null;
+                json_difference(
+                    x.get(k).unwrap_or(&n),
+                    y.get(k).unwrap_or(&n),
+                    format!("{at}.{k}"),
+                )
+            })
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x
+            .iter()
+            .zip(y)
+            .enumerate()
+            .find_map(|(i, (p, q))| json_difference(p, q, format!("{at}[{i}]"))),
+        _ if a == b => None,
+        _ => {
+            let short = |v: &Value| v.to_string().chars().take(200).collect::<String>();
+            Some(format!("{at}: {} then {}", short(a), short(b)))
+        }
+    }
 }
 
 /// A repro file: the failing sequence plus context.

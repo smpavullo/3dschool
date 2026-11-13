@@ -67,6 +67,9 @@ export const EMPTY_VIEW: ToolView = { overlay: [], marker: null, labels: [], box
 export interface InferContext {
   /** The gesture's start point: axis, parallel and perpendicular inferences run from it. */
   start?: V3;
+  /** Directions not to offer as lines through `start` (a lock keeps them): a rectangle's far
+   * corner on its own sides would have no width. */
+  skipStartLines?: V3[];
   /** Points to project: snaps are made on this plane (a face being drawn on). */
   plane?: { origin: V3; normal: V3 } | null;
   /** A locked direction from `start` (arrow keys, Shift-held inference). */
@@ -115,6 +118,15 @@ export interface ToolHost {
    */
   target(): Target | null;
   setTarget(t: Target | null): void;
+  /**
+   * Lane 43 (#7): after a tool's edit has landed and it set the selection (and Push/Pull's
+   * target) it leaves: `before` is what was selected when the edit started. Undo of that one
+   * step selects `before` again and Redo of it selects what the tool left, each where it
+   * still exists, instead of whatever was selected at the time (a split region's old id
+   * names one of its pieces again after a Redo). Optional: a host without it keeps the
+   * selection through undo and redo as before.
+   */
+  rememberSelection?(before: Entity[]): void;
   /** World rings of a face or region, or (lane 23) a curve's points as one ring (empty when
    * it is gone). */
   outline(t: OutlineTarget): Promise<V3[][]>;
@@ -148,8 +160,19 @@ export abstract class Tool {
   }
   /** Shift went down or up (some tools lock the current inference while it is held). */
   onShift(_down: boolean): void {}
-  /** Ctrl or Alt was tapped (Move and Rotate toggle copying; Move toggles autofold). */
+  /** Ctrl or Alt was tapped (Move and Rotate toggle copying; Move toggles autofold). An Alt
+   * tap is a press and release of Alt with no other key or pointer press between them
+   * (lane 30: Alt held for an Alt+drag orbit is not a tap). */
   onModifier(_key: "ctrl" | "alt"): void {}
+  /** Lane 30: the left button moves the view under this tool (the Orbit and Pan tools). */
+  navigation(): "orbit" | "pan" | null {
+    return null;
+  }
+  /** Lane 30: Alt with the left button means something to this tool (Paint picks a material
+   * up, Section Plane reverses the cut), so Alt+drag does not orbit here. */
+  keepsAlt(): boolean {
+    return false;
+  }
   /** Enter in the Value Control Box. */
   onValue(_text: string): void {}
   /** Esc. Return true when it cancelled something. */

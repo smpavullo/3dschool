@@ -36,9 +36,10 @@ describe("App shell", () => {
   it("shows every tool with its 2017-default key cap", () => {
     render(<App />);
     const caps = [...document.querySelectorAll(".tool kbd")].map((k) => k.textContent);
-    expect(caps).toEqual(["␣", "E", "L", "R", "C", "A", "P", "M", "Q", "S", "F", "W", "T", "D", "B"]);
-    // Lane 12's Section Plane has no default key (SketchUp 2017 had none either).
-    expect(TOOLS).toHaveLength(16);
+    expect(caps).toEqual(["␣", "E", "L", "R", "C", "A", "P", "M", "Q", "S", "F", "W", "T", "D", "B", "O", "H"]);
+    // Lane 12's Section Plane has no default key (SketchUp 2017 had none either); lane 30's
+    // Orbit and Pan have SketchUp 2017's O and H.
+    expect(TOOLS).toHaveLength(18);
     expect(TOOLS.find((t) => t.id === "section")?.key).toBe("");
     expect(document.querySelector('.tool[data-tool="section"] kbd')).toBeNull();
     expect(pressed("select")).toBe(true);
@@ -48,13 +49,180 @@ describe("App shell", () => {
     render(<App />);
     const keys: [string, string][] = [
       ["e", "erase"], ["l", "line"], ["r", "rect"], ["c", "circle"], ["a", "arc"], ["p", "pushpull"], ["m", "move"],
-      ["q", "rotate"], ["s", "scale"], ["f", "offset"], ["w", "follow"], ["t", "tape"], ["d", "dim"], ["b", "paint"], [" ", "select"],
+      ["q", "rotate"], ["s", "scale"], ["f", "offset"], ["w", "follow"], ["t", "tape"], ["d", "dim"], ["b", "paint"], ["o", "orbit"], ["h", "pan"], [" ", "select"],
     ];
     for (const [key, tool] of keys) {
       act(() => {
         fireEvent.keyDown(window, { key });
       });
       expect(pressed(tool)).toBe(true);
+    }
+  });
+
+  it("O and H pick Orbit and Pan (lane 30, #36); Esc goes back to the tool before them", async () => {
+    render(<App />);
+    const key = async (k: string) => {
+      await act(async () => {
+        fireEvent.keyDown(window, { key: k });
+      });
+    };
+    const hint = () => document.getElementById("hint")?.textContent ?? "";
+    await key("l");
+    expect(pressed("line")).toBe(true);
+    await key("o");
+    expect(pressed("orbit")).toBe(true);
+    expect(hint()).toBe("Orbit. Drag to orbit around the point under the cursor. Shift+drag pans. Esc goes back to the tool before.");
+    expect(document.querySelector('.tool[data-tool="orbit"] kbd')?.textContent).toBe("O");
+    expect((document.getElementById("cv") as HTMLCanvasElement).style.cursor).toBe("grab");
+    // Orbit, then Pan: Esc still goes back to Line, the tool before both.
+    await key("h");
+    expect(pressed("pan")).toBe(true);
+    expect(hint()).toBe("Pan. Drag to pan: the point you grab stays under the cursor. Esc goes back to the tool before.");
+    await key("Escape");
+    expect(pressed("line")).toBe(true);
+    // From Select (the rail's button this time), Esc goes back to Select.
+    await key(" ");
+    fireEvent.click(document.querySelector('.tool[data-tool="orbit"]')!);
+    expect(pressed("orbit")).toBe(true);
+    await key("Escape");
+    expect(pressed("select")).toBe(true);
+    // Esc in Select is Select's own again (nothing to go back to).
+    await key("Escape");
+    expect(pressed("select")).toBe(true);
+  });
+
+  it("the View menu has Orbit (O) and Pan (H), checked while active (lane 30)", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "View" }));
+    const orbit = screen.getByRole("menuitemcheckbox", { name: /Orbit\s*O$/ });
+    expect(orbit.getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByRole("menuitemcheckbox", { name: /Pan\s*H$/ })).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(orbit);
+    });
+    expect(pressed("orbit")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "View" }));
+    expect(screen.getByRole("menuitemcheckbox", { name: /Orbit\s*O$/ }).getAttribute("aria-checked")).toBe("true");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: /Pan\s*H$/ }));
+    });
+    expect(pressed("pan")).toBe(true);
+  });
+
+  it("an Alt tap is a press and release with nothing between: Alt held for an Alt+drag is not one (lane 30)", async () => {
+    render(<App />);
+    const hint = () => document.getElementById("hint")?.textContent ?? "";
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "m" });
+    });
+    expect(pressed("move")).toBe(true);
+    // A tap switches Move's autofold, on the release.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Alt", altKey: true });
+    });
+    expect(hint()).not.toMatch(/Autofold/);
+    await act(async () => {
+      fireEvent.keyUp(window, { key: "Alt" });
+    });
+    expect(hint()).toMatch(/^Move\. Autofold on/);
+    // Alt held while the button goes down (an Alt+drag orbit): no switch.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+      fireEvent.keyDown(window, { key: "Alt", altKey: true });
+      fireEvent.pointerDown(document.getElementById("cv")!, { button: 0, buttons: 1, altKey: true });
+      fireEvent.pointerUp(document.getElementById("cv")!, { button: 0, altKey: true });
+      fireEvent.keyUp(window, { key: "Alt" });
+    });
+    expect(hint()).not.toMatch(/Autofold/);
+    // Nor with another key between (Alt+Shift+K, a plugin's shortcut).
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Alt", altKey: true });
+      fireEvent.keyDown(window, { key: "K", altKey: true, shiftKey: true });
+      fireEvent.keyUp(window, { key: "Alt" });
+    });
+    expect(hint()).not.toMatch(/Autofold/);
+    // And the next tap switches it back off.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Alt", altKey: true });
+      fireEvent.keyUp(window, { key: "Alt" });
+    });
+    expect(hint()).toMatch(/^Move\. Autofold off/);
+  });
+
+  it("Windows and Linux: a Ctrl tap still counts as the key goes down, and its release does nothing more", async () => {
+    for (const os of ["Win32", "Linux x86_64"]) {
+      const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue(os);
+      try {
+        render(<App />);
+        const hint = () => document.getElementById("hint")?.textContent ?? "";
+        await act(async () => {
+          fireEvent.keyDown(window, { key: "m" });
+        });
+        expect(pressed("move")).toBe(true);
+        await act(async () => {
+          fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
+        });
+        expect(hint(), os).toMatch(/Copying/);
+        await act(async () => {
+          fireEvent.keyUp(window, { key: "Control" });
+        });
+        expect(hint(), os).toMatch(/Copying/);
+        // Ctrl held while the button goes down and comes up: the key down was the tap, as before.
+        await act(async () => {
+          fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
+          fireEvent.pointerDown(document.getElementById("cv")!, { button: 0, buttons: 1, ctrlKey: true });
+          fireEvent.pointerUp(document.getElementById("cv")!, { button: 0, ctrlKey: true });
+          fireEvent.keyUp(window, { key: "Control" });
+        });
+        expect(hint(), os).toMatch(/Moving \(not copying\)/);
+      } finally {
+        platform.mockRestore();
+        cleanup();
+      }
+    }
+  });
+
+  it("macOS: a Control tap is its release with nothing between, so a Control+drag pan is not one", async () => {
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    try {
+      render(<App />);
+      const hint = () => document.getElementById("hint")?.textContent ?? "";
+      await act(async () => {
+        fireEvent.keyDown(window, { key: "m" });
+      });
+      expect(pressed("move")).toBe(true);
+      // A tap switches Move's copying, on the release.
+      await act(async () => {
+        fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
+      });
+      expect(hint()).not.toMatch(/Copying/);
+      await act(async () => {
+        fireEvent.keyUp(window, { key: "Control" });
+      });
+      expect(hint()).toMatch(/Copying/);
+      // Control held while the button goes down (a Control+drag pan): no switch.
+      await act(async () => {
+        fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
+        fireEvent.pointerDown(document.getElementById("cv")!, { button: 0, buttons: 1, ctrlKey: true });
+        fireEvent.pointerUp(document.getElementById("cv")!, { button: 0, ctrlKey: true });
+        fireEvent.keyUp(window, { key: "Control" });
+      });
+      expect(hint()).toMatch(/Copying/);
+      // Nor with another key between (Control+Z).
+      await act(async () => {
+        fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
+        fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+        fireEvent.keyUp(window, { key: "Control" });
+      });
+      expect(hint()).not.toMatch(/Moving \(not copying\)/);
+      // And the next tap switches it back.
+      await act(async () => {
+        fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
+        fireEvent.keyUp(window, { key: "Control" });
+      });
+      expect(hint()).toMatch(/Moving \(not copying\)/);
+    } finally {
+      platform.mockRestore();
     }
   });
 

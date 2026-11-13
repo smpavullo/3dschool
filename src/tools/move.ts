@@ -30,7 +30,7 @@ import { LockState } from "./lock";
 import { scopeEntity } from "../lib/scope";
 import { curveOf } from "../lib/curves";
 import { EMPTY_VIEW, Tool, inferenceLine, markerOf, type InferContext, type Snap, type ToolEvent, type ToolView } from "./tool";
-import { curvePointRefusal, describeSubject, geometryOp, isCopied, isSketchEntity, loadOutlines, movedSelection, objectsOp, previewSegments, sketchPreviews, sketchSegments, subjectEdges, subjectOf, translation, type SketchPreview, type Subject } from "./xform";
+import { curvePointRefusal, describeSubject, geometryOp, isCopied, isSketchEntity, loadOutlines, movedSelection, targetAfterMove, sketchesAfter, objectsOp, previewSegments, sketchPreviews, sketchSegments, subjectEdges, subjectOf, translation, type SketchPreview, type Subject } from "./xform";
 
 interface Gesture {
   subject: Subject;
@@ -287,6 +287,8 @@ export class MoveTool extends Tool {
     // Named before the edit (lane 22): a region lifted onto another plane is another one after it.
     const what = describeSubject(subject, this.host.mesh());
     const how = `${h.fmt(len(delta))} ${h.unitLabel()} along ${dirName(delta)}`;
+    // Lane 43 (#7): Push/Pull's target before the edit, which the target after it follows.
+    const pushed = h.target();
     const r = await h.apply(op, (res: EditResult) => {
       const o = res.outcome;
       if (isCopied(o) && count > 1) return `Array: ${count} copies of ${what}, ${how} apart. Type another count, or a distance.`;
@@ -298,7 +300,14 @@ export class MoveTool extends Tool {
       this.last = { subject, delta, copy: copy && subject.kind === "objects", count, sel, sk };
       h.showValue(h.fmt(len(delta)));
       // Selected sketch geometry stays selected where it went (lane 22).
-      if (!copy && subject.sketches?.length && sel.length) h.setSelection(movedSelection(sel, subject, sk, translation(delta), r.outcome));
+      if (!copy && subject.sketches?.length && sel.length) {
+        const next = movedSelection(sel, subject, sk, translation(delta), r.outcome, r.scene?.mesh);
+        h.setSelection(next);
+        // #7: Push/Pull's target follows a region the move turned into pieces.
+        h.setTarget(targetAfterMove(pushed, sel, next, sketchesAfter(subject, r.outcome)));
+        // Lane 43 (#7): Undo and Redo of this step put back the selection before and after it.
+        h.rememberSelection?.(sel);
+      }
     }
   }
 
