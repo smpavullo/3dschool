@@ -50,6 +50,10 @@
 //! **Numbers.** Areas and efficiency come from the exact sizes. Only `+ - * /`, `min`, `max`
 //! and comparisons are used, nothing is random, every tie is broken by input order: the
 //! same model gives the same layout, natively and in WASM, and [`Nesting::hash`] says so.
+//! Parts that fill their stock can add up to a hair more than it by rounding alone (nine
+//! 16 x 32 in parts on a 4 x 8 sheet came to 4.4e-16 m² over it); such a sum is reported as
+//! the stock's area ([`up_to_stock`]), so a full sheet shows no waste and 100%, never a hair
+//! under none. Anything more than rounding can make is left as it is.
 
 use std::collections::BTreeMap;
 
@@ -64,12 +68,46 @@ use crate::stock::{
 
 /// Geometric slack in fits and gaps (1 nm): floating-point noise only.
 pub const EPS: f64 = 1e-9;
+
+/// Lane 51: an area of parts as reported against the `stock` area it was cut from: `stock`
+/// when the parts come to more than it by no more than rounding can add, else the parts'
+/// own sum, so a filled sheet or board shows exactly no waste and an efficiency of exactly
+/// 1, and parts truly larger than their stock still show.
+///
+/// `parts` is a sum of `terms` values (areas of parts, each a product of two sizes, or areas
+/// of pieces already within their stock). With u = `f64::EPSILON` / 2, each product, each
+/// addition and the stock's own product `length * width` are off by at most u of what they
+/// stand for, and a size of a part one rounding over its exact share of the stock (a third
+/// of a width) adds at most 2u to its area. So when the parts truly fit, `parts` is at most
+/// about `stock * (1 + (terms + 5) u)`, under the slack `(terms + 2) * f64::EPSILON * stock`
+/// for any `terms` of 1 or more. On a 4 x 8 sheet with 100 parts the slack is about 7e-14
+/// m², far less than a part one nanometre (the fits' [`EPS`]) too long could add.
+pub fn up_to_stock(parts: f64, stock: f64, terms: usize) -> f64 {
+    let slack = (terms as f64 + 2.0) * f64::EPSILON * stock;
+    if parts > stock && parts - stock <= slack {
+        stock
+    } else {
+        parts
+    }
+}
 /// Lane 42 (#49): the most strips a glue-up is planned from. A part that would take more
 /// (a board barely wider than the joint loss) is reported too large instead.
 pub const MAX_GLUE_STRIPS: usize = 100;
 /// Lane 42 (#49): the narrowest filler a glue-up plans, besides the kerf: 1 mm, the
 /// narrowest stock the library takes.
 pub const MIN_GLUE_FILLER: f64 = crate::stock::MIN_STOCK;
+
+/// #56: the narrowest a glue-up's last strip is left on a board `board_width` wide: the
+/// smaller of 1 1/2 in and a quarter of the board. A last strip narrower than that and the
+/// full strip before it are made two equal strips. #57: with the document's minimum strip
+/// set (`NestSettings::min_strip`), that setting, but never more than half the board, so the
+/// two equal strips are never under it.
+pub fn glue_minimum(board_width: f64, set: Option<f64>) -> f64 {
+    match set {
+        Some(m) => m.min(0.5 * board_width),
+        None => (1.5 * crate::cutlist::M_PER_IN).min(0.25 * board_width),
+    }
+}
 /// Nodes the board lookahead may visit for one board, and in all.
 const LOOKAHEAD_PER_BOARD: usize = 20_000;
 const LOOKAHEAD_TOTAL: usize = 400_000;
@@ -452,7 +490,14 @@ fn fit(row: &CutRow, s: &StockDef, trim: f64) -> Result<Vec<(f64, f64, bool)>, U
 /// apart by a hair: a part 12 in and 1 nm wide on 6 in boards with no joint loss counted 2
 /// strips with a filler a hair wider than 6 in and 1 nm, and the layout refused the strip.
 /// A part of no length (1 nm or less) is never glued: its strips would be of no length.
-fn glue_widths(row: &CutRow, s: &StockDef, trim: f64, joint: f64, kerf: f64) -> Option<Vec<f64>> {
+fn glue_widths(
+    row: &CutRow,
+    s: &StockDef,
+    trim: f64,
+    joint: f64,
+    kerf: f64,
+    min_strip: Option<f64>,
+) -> Option<Vec<f64>> {
     if s.kind != StockKind::Board || row.sheet || row.grain == Grain::Width {
         return None;
     }
@@ -479,11 +524,23 @@ fn glue_widths(row: &CutRow, s: &StockDef, trim: f64, joint: f64, kerf: f64) -> 
         return None;
     }
     let filler = filler_of(n);
-    if filler.is_nan() || filler > u.h + EPS || filler < kerf.max(MIN_GLUE_FILLER) - EPS {
+    if filler.is_nan() || filler > u.h + EPS {
         return None;
     }
     let mut v = vec![u.h; n as usize - 1];
     v.push(filler);
+    // #56: a filler under the minimum and the full strip before it become two equal strips,
+    // each half of the two (at least half the board, so never under the minimum).
+    if filler < glue_minimum(u.h, min_strip) {
+        let half = 0.5 * (u.h + filler);
+        let k = v.len();
+        v[k - 2] = half;
+        v[k - 1] = half;
+    }
+    // Lane 42's refusals, on the narrowest strip planned.
+    if v[v.len() - 1] < kerf.max(MIN_GLUE_FILLER) - EPS {
+        return None;
+    }
     Some(v)
 }
 
@@ -522,6 +579,7 @@ fn choose_stock(
     trim: f64,
     joint: f64,
     kerf: f64,
+    min_strip: Option<f64>,
 ) -> Vec<Choice> {
     let n = list.rows.len();
     let mut out: Vec<Option<Choice>> = vec![None; n];
@@ -662,26 +720,43 @@ fn choose_stock(
         });
         let all_fit = |s: &StockDef| shared.iter().all(|&i| fit(&list.rows[i], s, trim).is_ok());
         let mut shared_board = None;
-        if let Some(&(k, _)) = wide.iter().find(|(_, s)| all_fit(s)).or(wide.first()) {
+        // #56: a part the shared board cannot hold at all (too long for it) goes on as a
+        // part no board is wide enough for, so a longer board can glue it or hold it whole;
+        // if none can, it keeps the shared board, as before.
+        let mut too_long = Vec::new();
+        if let Some(&(k, s)) = wide.iter().find(|(_, s)| all_fit(s)).or(wide.first()) {
             for &i in &shared {
                 out[i] = Some(Ok(k));
+                if matches!(fit(&list.rows[i], s, trim), Err(UnplacedReason::TooLarge)) {
+                    too_long.push(i);
+                }
             }
             shared_board = (!shared.is_empty()).then_some(k);
         }
-        for &i in &alone {
-            // #49: glued up from the board the rest of the material uses, so its strips
-            // nest with the other parts, when they can make it; but never when some board
-            // thick enough makes it in one piece (a thicker, wider one, say), which the
-            // choice below then takes as before.
+        let alone = alone.iter().map(|&i| (i, false));
+        for (i, kept) in alone.chain(too_long.iter().map(|&i| (i, true))) {
+            // #49: glued up, but never when some board thick enough makes it in one piece
+            // (a thicker, wider one, say), which the choice below then takes as before. #56:
+            // from the board of the class that glues it with the fewest strips (a board
+            // shorter than the part glues nothing), then the board the rest of the material
+            // uses, so its strips nest with the other parts, then library order.
             let row = &list.rows[i];
             let whole_somewhere = boards
                 .iter()
                 .any(|(_, s)| thickness_fits(s, row.size[0]) && fit(row, s, trim).is_ok());
-            if !whole_somewhere
-                && let Some(k) = shared_board
-                && glue_widths(row, &lib.stocks[k], trim, joint, kerf).is_some()
-            {
+            let glued = boards
+                .iter()
+                .filter(|(_, s)| s.thickness == class)
+                .filter_map(|&(k, s)| {
+                    let strips = glue_widths(row, s, trim, joint, kerf, min_strip)?.len();
+                    Some((strips, Some(k) != shared_board, k))
+                })
+                .min();
+            if !whole_somewhere && let Some((_, _, k)) = glued {
                 out[i] = Some(Ok(k));
+                continue;
+            }
+            if kept && !whole_somewhere {
                 continue;
             }
             // Each on its own best board: fitting first (then fitting across its grain),
@@ -1332,7 +1407,14 @@ fn trim_cuts(s: &StockDef, trim: f64, kerf: f64) -> Vec<Cut> {
 pub fn nest_list(list: &CutList, lib: &StockLibrary, settings: NestSettings) -> Nesting {
     let kerf = settings.kerf;
     let trim = effective_trim(settings.trim, kerf);
-    let choice = choose_stock(list, lib, trim, settings.joint_loss, kerf);
+    let choice = choose_stock(
+        list,
+        lib,
+        trim,
+        settings.joint_loss,
+        kerf,
+        settings.min_strip,
+    );
     let mut glue_ups: Vec<GlueUp> = Vec::new();
     let mut needs: Vec<Need> = Vec::new();
     let mut unplaced: Vec<Unplaced> = Vec::new();
@@ -1353,9 +1435,16 @@ pub fn nest_list(list: &CutList, lib: &StockLibrary, settings: NestSettings) -> 
         // Whole, with its orientations; or (#49) glued up from strips of these widths.
         let stocked = choice[ri].and_then(|k| match fit(row, &lib.stocks[k], trim) {
             Ok(o) => Ok((k, o, None)),
-            Err(r) => glue_widths(row, &lib.stocks[k], trim, settings.joint_loss, kerf)
-                .map(|v| (k, Vec::new(), Some(v)))
-                .ok_or((r, Some(k))),
+            Err(r) => glue_widths(
+                row,
+                &lib.stocks[k],
+                trim,
+                settings.joint_loss,
+                kerf,
+                settings.min_strip,
+            )
+            .map(|v| (k, Vec::new(), Some(v)))
+            .ok_or((r, Some(k))),
         });
         for (ci, o) in counted.iter().enumerate() {
             let copy = ci + 1;
@@ -1455,6 +1544,9 @@ pub fn nest_list(list: &CutList, lib: &StockLibrary, settings: NestSettings) -> 
             efficiency: 0.0,
             board_feet: s.board_feet() * count as f64,
         };
+        // Lane 51: every piece's parts within its stock, so the group's sum may be brought
+        // back to the group's stock as well; a piece over it keeps the group over it too.
+        let mut fits = true;
         for (seq, puts) in layout.into_iter().enumerate() {
             // Placements in reading order: on a sheet along the length, then across; on a
             // board section by section along it, then across a section, the order its cuts
@@ -1499,7 +1591,12 @@ pub fn nest_list(list: &CutList, lib: &StockLibrary, settings: NestSettings) -> 
                     }
                 })
                 .collect();
-            let parts_area: f64 = placements.iter().map(|p| p.dx * p.dy).sum();
+            let parts_area = up_to_stock(
+                placements.iter().map(|p| p.dx * p.dy).sum(),
+                stock_area,
+                placements.len(),
+            );
+            fits &= parts_area <= stock_area;
             // A glued part counts once, by its first strip.
             g.parts += placements
                 .iter()
@@ -1531,6 +1628,9 @@ pub fn nest_list(list: &CutList, lib: &StockLibrary, settings: NestSettings) -> 
                 efficiency: parts_area / stock_area,
             });
         }
+        if fits {
+            g.parts_area = up_to_stock(g.parts_area, g.stock_area, count);
+        }
         g.efficiency = if g.stock_area > 0.0 {
             g.parts_area / g.stock_area
         } else {
@@ -1560,6 +1660,9 @@ pub fn nest_list(list: &CutList, lib: &StockLibrary, settings: NestSettings) -> 
         .count();
     // Added up from 0.0: an f64 `sum` over nothing is -0.0, which a nesting with nothing
     // placed showed as -0.0 areas (lane 30).
+    // Lane 51: both are added up piece by piece in the same order, and a rounded addition
+    // never makes a smaller sum of larger terms, so with every piece's parts within its stock
+    // (`up_to_stock`) the total parts are within the total stock without a slack of their own.
     let parts_area: f64 = pieces.iter().fold(0.0, |s, p| s + p.parts_area);
     let stock_area: f64 = pieces.iter().fold(0.0, |s, p| s + p.stock_area);
     let totals = NestTotals {

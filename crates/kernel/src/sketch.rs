@@ -162,6 +162,523 @@ pub(crate) fn proper_cross(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> bool {
     o1 * o2 < 0.0 && o3 * o4 < 0.0
 }
 
+/// Lane 53 (#65): what a long stroke's insertion looks up, by place: a grid of square cells
+/// (side `cell`, at least four merge distances) holding each vertex in its own cell and each
+/// edge in the cells of points sampled along it at most half a cell apart
+/// ([`sample_keys`]), and a table from each vertex pair to the edge joining it.
+///
+/// A query looks in the cells around the samples of its point or segment (the eight around
+/// each, too). A vertex within the merge distance of a point of the query is within half a
+/// cell of one of its samples, so in a cell next to that sample's; an edge within the merge
+/// distance of the query, or crossing it, has a point there within a quarter cell of one of
+/// its own samples, whose cell is next to the query sample's. So a lookup holds every vertex
+/// and edge the full scan would find (and more). Entries are only ever added: a vertex never
+/// moves while a stroke goes in, an edge split or taken out keeps its old entries (its pieces
+/// lie within the old one), and each candidate is tested on what the sketch holds now. A
+/// table entry for an edge taken out, or split, is tested the same way.
+///
+/// It is a third grid beside the repair's `PointGrid` and `EdgeGrid` because those are built
+/// once over a fixed set and answer one question each (the first close pair in scan order);
+/// this one grows as the stroke goes in (every split and new edge enters it) and answers
+/// several questions about one point or segment at a time.
+#[derive(Debug)]
+pub(crate) struct Lookup {
+    cell: f64,
+    verts: std::collections::HashMap<(i64, i64), Vec<SVertexId>>,
+    edges: std::collections::HashMap<(i64, i64), Vec<SEdgeId>>,
+    pairs: std::collections::HashMap<(SVertexId, SVertexId), SEdgeId>,
+    /// Vertex and edge entries held (each a key in a cell's list, stale ones included).
+    entries: usize,
+    /// Most entries it may hold ([`lookup_ceiling`]); past it the lookup is dropped.
+    ceiling: usize,
+    /// Queries that came back with more than a quarter of the sketch ([`LOOKUP_POOR`]).
+    poor: std::cell::Cell<u32>,
+}
+
+thread_local! {
+    /// Lane 70: a test-only measure, not a feature (nothing in the kernel reads it). Every
+    /// vertex, edge and curve point the sketch's searches look at on this thread, counted
+    /// once per search: a scan counts the whole sketch, a [`Lookup`] the entries it enters
+    /// and those in the cells a query reads, the grid of the vertices the same, and each
+    /// curve settled its points. The same number on every run and machine for the same ops,
+    /// so `tests/move_redraw.rs` holds how a Move's work grows without a clock
+    /// ([`crate::testing::sketch_visits`]). Per thread, so tests on other threads never add
+    /// to it; one add per search, never per item, so it costs nothing that can be measured.
+    static VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Lane 70: count `n` visits ([`VISITS`]).
+#[inline]
+fn visit(n: usize) {
+    VISITS.with(|c| c.set(c.get().wrapping_add(n as u64)));
+}
+
+/// Lane 70: the visits counted on this thread so far ([`VISITS`]).
+pub(crate) fn visits() -> u64 {
+    VISITS.with(std::cell::Cell::get)
+}
+
+/// Lane 53 (#65): a [`Lookup`] whose queries come back with more than a quarter of the
+/// sketch this many times, once the sketch holds 4,096 vertices and edges (under that the
+/// scans cost little either way), is dropped and the scans take over: its cells are too big
+/// for the sketch (an import of 3,000 parallel lines 5 m long and 1 cm apart, in cells of 5 m, took
+/// 0.27 s through it and 0.21 s with the scans).
+pub const LOOKUP_POOR: u32 = 16;
+
+/// Lane 53 (#65): a stroke is inserted through a [`Lookup`] only when its segments times
+/// the sketch's vertices, edges and segments after it come to at least this (a cheap first
+/// test: the cost rule, [`LOOKUP_BUILD_COST`], never accepts less than about 72,000); under it the scans
+/// are cheaper (measured in a release build: a 65-point zigzag into an empty sketch took
+/// 0.24 ms through a lookup and 0.08 ms with the scans, 250 points about the same, 0.9 ms
+/// and 0.8 ms; 65 points beside 2,000 edges 13.8 ms against 15.9 ms).
+pub const LOOKUP_MIN_WORK: usize = 65_536;
+
+/// Lane 53 (#65): what entering one vertex or edge sample in a [`Lookup`] costs, and what
+/// one query costs before it finds anything (finding nine cells), counted in visits of one
+/// vertex or edge by the scans; calibrated in a release build. A lookup is built only when
+/// its estimated cost, building it and its queries, is at most half the scans'. Beside 250
+/// lines 0.52 m long, 3 mm apart, a stroke of 128 or 512 segments of 0.5 mm built one with
+/// cells as big as the lines, whose queries found most of them, and took 1.4 times as long
+/// as the scans; it now scans.
+pub const LOOKUP_BUILD_COST: f64 = 10.0;
+pub const LOOKUP_QUERY_COST: f64 = 360.0;
+
+/// Lane 53 (#65): and only for strokes of at least this many segments: building a lookup
+/// costs about as much as one pass over the sketch with a large constant, which a stroke of a
+/// few dozen segments does not win back (measured in a release build, a lookup against the
+/// scans: 16 segments beside 1,920 to 38,400 vertices and edges 1 to 5% slower, 32 segments
+/// level, 64 segments 9 to 20% faster, 1,024 segments three to five times faster; the 24
+/// segment circle the Circle tool draws always scans).
+pub const LOOKUP_MIN_SEGMENTS: usize = 48;
+
+/// Lane 53 (#65): a cell of a [`Lookup`] holding more than this many vertices or edges, and
+/// more than an eighth of all it holds, is crowded: the lookup is dropped and the scans take
+/// over. A stroke that crosses itself thousands of times packs a few cells with most of the
+/// sketch, and a lookup that answers every query with most of the sketch costs more than the
+/// scans (a hostile 4,650-point import that ends with 145,088 edges took 30 s through it, 17
+/// s with the scans).
+pub const LOOKUP_CELL_MAX: usize = 256;
+
+/// Lane 53 (#65): most entries a [`Lookup`] for a sketch of `size` vertices and edges and a
+/// stroke of `segs` segments may hold: four for each of them, and 65,536 more. An entry is a
+/// key of 8 bytes in a cell's list, a cell (at most one per entry) a slot of about 48 bytes
+/// in a map, and each edge a slot in the table of vertex pairs, so a lookup takes at most
+/// about 250 bytes per vertex, edge and segment, and usually far less (beside 19,000 lines
+/// of 1 m and a stroke of 5,000 segments the process peaked 1.6 MB above the scans'). The
+/// lookup it replaced registered each edge in nine cells around every sample, with no such
+/// bound: 686 MB beside 19,000 lines of 1 m.
+pub fn lookup_ceiling(size: usize, segs: usize) -> usize {
+    4usize
+        .saturating_mul(size.saturating_add(segs))
+        .saturating_add(65_536)
+}
+
+/// Lane 53 (#65): samples [`sample_keys`] takes along a segment `len` long in cells of side
+/// `cell` (at most half a cell apart, both ends included); `usize::MAX` when not finite or
+/// past what a `usize` holds.
+fn samples(len: f64, cell: f64) -> usize {
+    samples_within(len, cell, usize::MAX)
+}
+
+/// [`samples`] with `max` for the largest `usize` (the tests pass `u32::MAX`, as a 32-bit
+/// target such as wasm32 has it): a segment of a kilometre in cells of 40 micrometres needs
+/// 5e7 samples, and one over about 86 km more than a 32-bit `usize` holds (such a stroke is
+/// out of bounds, but an import's lengths are counted before its strokes are checked).
+fn samples_within(len: f64, cell: f64, max: usize) -> usize {
+    let steps = (len / (0.5 * cell)).ceil();
+    if steps.is_finite() && steps >= 0.0 && steps < (max as f64) - 2.0 {
+        (steps as usize).saturating_add(2).min(max)
+    } else {
+        max
+    }
+}
+
+impl Lookup {
+    /// A lookup for inserting `strokes` into `s`, or `None` (insert with the scans) for
+    /// strokes whose work is under `min_work` ([`LOOKUP_MIN_WORK`]; the tests that hold the
+    /// two ways to one result pass 0), or when no cell size keeps the entries the sketch and
+    /// the strokes need within [`lookup_ceiling`]. The entries are counted before anything is
+    /// built (one pass over the sketch's edges and the strokes' segments, nothing allocated),
+    /// for three cell sizes: the strokes' mean segment, the sketch's mean edge, and between
+    /// them; the one needing the fewest is used.
+    fn for_strokes<'a>(
+        s: &Sketch,
+        strokes: impl Iterator<Item = (&'a [DVec2], bool)> + Clone,
+        min_work: usize,
+    ) -> Option<Lookup> {
+        let seg_lens = |f: &mut dyn FnMut(f64)| {
+            for (pts, closed) in strokes.clone() {
+                let n = pts.len();
+                let k = if closed { n } else { n.saturating_sub(1) };
+                for i in 0..k.min(n) {
+                    f(pts[i].distance(pts[(i + 1) % n]));
+                }
+            }
+        };
+        let (mut segs, mut total) = (0usize, 0.0f64);
+        seg_lens(&mut |d| {
+            segs += 1;
+            total += d;
+        });
+        if !total.is_finite() {
+            return None;
+        }
+        let size = s.vertices.len() + s.edges.len();
+        let work = segs.saturating_mul(segs + size);
+        if segs == 0 || work < min_work || (min_work > 0 && segs < LOOKUP_MIN_SEGMENTS) {
+            return None;
+        }
+        let edge_len = |[a, b]: &[SVertexId; 2]| s.vertices[*a].distance(s.vertices[*b]);
+        let floor = Self::floor();
+        let stroke_mean = (total / segs as f64).max(floor);
+        let sketch_mean = if s.edges.is_empty() {
+            stroke_mean
+        } else {
+            (s.edges.values().map(edge_len).sum::<f64>() / s.edges.len() as f64).max(floor)
+        };
+        let ceiling = lookup_ceiling(size, segs);
+        let need = |cell: f64| {
+            let mut n = s.vertices.len();
+            for e in s.edges.values() {
+                n = n.saturating_add(samples(edge_len(e), cell));
+            }
+            seg_lens(&mut |d| n = n.saturating_add(samples(d, cell)));
+            n
+        };
+        let cells = [stroke_mean, (stroke_mean * sketch_mean).sqrt(), sketch_mean];
+        if min_work == 0 {
+            // The tests that hold the two ways to one result: the cell needing the fewest
+            // entries, whatever it would cost.
+            let (n, cell) = cells
+                .into_iter()
+                .map(|c| (need(c), c))
+                .min_by(|x, y| x.0.cmp(&y.0).then(x.1.total_cmp(&y.1)))?;
+            return (n <= ceiling)
+                .then(|| Self::build(s, cell, ceiling))
+                .flatten();
+        }
+        // What a lookup would cost against the scans it saves, in visits of one vertex or
+        // edge ([`LOOKUP_BUILD_COST`]): building it, and for each segment its queries, each
+        // finding about the entries in nine cells of the box the sketch and the strokes
+        // cover; the scans visit every vertex and edge four times a segment. The cheapest cell
+        // is used, and only when the lookup costs at most half the scans.
+        let (mut lo, mut hi) = (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY));
+        for p in s.vertices.values() {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        for (pts, _) in strokes.clone() {
+            for p in pts {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+        }
+        let extent = (hi - lo).max(DVec2::ZERO);
+        let cost = |n: usize, cell: f64| -> f64 {
+            let over = ((extent.x / cell).ceil() + 1.0) * ((extent.y / cell).ceil() + 1.0);
+            let found = (9.0 * n as f64 / over.max(1.0)).min(n as f64);
+            LOOKUP_BUILD_COST * n as f64 + segs as f64 * (LOOKUP_QUERY_COST + 4.0 * found)
+        };
+        let (n, cell, c) = cells
+            .into_iter()
+            .map(|cell| {
+                let n = need(cell);
+                (n, cell, cost(n, cell))
+            })
+            .filter(|(n, _, c)| *n <= ceiling && c.is_finite())
+            .min_by(|x, y| x.2.total_cmp(&y.2).then(x.1.total_cmp(&y.1)))?;
+        let scans = 4.0 * segs as f64 * (size as f64 + segs as f64 / 2.0);
+        if 2.0 * c > scans {
+            return None;
+        }
+        let _ = n;
+        Self::build(s, cell, ceiling)
+    }
+
+    /// A lookup of `s` in cells of side `cell` (at least [`Self::floor`]), holding at most
+    /// `ceiling` entries, or `None` when the sketch alone would pass it or crowd a cell.
+    fn build(s: &Sketch, cell: f64, ceiling: usize) -> Option<Lookup> {
+        let mut l = Lookup {
+            cell,
+            verts: Default::default(),
+            edges: Default::default(),
+            pairs: Default::default(),
+            entries: 0,
+            ceiling,
+            poor: Default::default(),
+        };
+        for (v, p) in &s.vertices {
+            if !l.add_vertex(v, *p) {
+                return None;
+            }
+        }
+        for (e, [a, b]) in &s.edges {
+            if !l.add_edge(e, *a, *b, s.vertices[*a], s.vertices[*b]) {
+                return None;
+            }
+        }
+        Some(l)
+    }
+
+    /// The smallest cell: four merge distances, so a point within the merge distance of a
+    /// point within a quarter cell of a sample is in that sample's cell or one next to it.
+    fn floor() -> f64 {
+        4.0 * SKETCH_MERGE
+    }
+
+    fn key(&self, p: DVec2) -> (i64, i64) {
+        (
+            (p.x / self.cell).floor() as i64,
+            (p.y / self.cell).floor() as i64,
+        )
+    }
+
+    /// Note a query that came back with `found` of the sketch's `size` vertices and edges.
+    fn found(&self, found: usize, size: usize) {
+        if size >= 4096 && found.saturating_mul(4) > size {
+            self.poor.set(self.poor.get() + 1);
+        }
+    }
+
+    /// Too many queries came back with too much ([`LOOKUP_POOR`]).
+    fn poor(&self) -> bool {
+        self.poor.get() >= LOOKUP_POOR
+    }
+
+    /// A cell's list of `len` entries is crowded ([`LOOKUP_CELL_MAX`]).
+    fn crowded(&self, len: usize) -> bool {
+        len > LOOKUP_CELL_MAX && len.saturating_mul(8) > self.entries
+    }
+
+    /// Enter vertex `v` at `p`; false when that crowds its cell or passes the ceiling.
+    fn add_vertex(&mut self, v: SVertexId, p: DVec2) -> bool {
+        let k = self.key(p);
+        let list = self.verts.entry(k).or_default();
+        list.push(v);
+        let len = list.len();
+        self.entries += 1;
+        visit(1);
+        self.entries <= self.ceiling && !self.crowded(len)
+    }
+
+    /// Enter edge `e` (`a`-`b`, at `pa`-`pb`); false when it would pass the ceiling or crowd
+    /// a cell.
+    fn add_edge(&mut self, e: SEdgeId, a: SVertexId, b: SVertexId, pa: DVec2, pb: DVec2) -> bool {
+        let room = self.ceiling.saturating_sub(self.entries);
+        let Some(keys) = sample_keys(pa, pb, self.cell, room) else {
+            return false;
+        };
+        self.entries += keys.len();
+        visit(keys.len());
+        for k in keys {
+            let list = self.edges.entry(k).or_default();
+            list.push(e);
+            let len = list.len();
+            if self.crowded(len) {
+                return false;
+            }
+        }
+        self.pairs.insert((a.min(b), a.max(b)), e);
+        true
+    }
+
+    /// The cells to look in for the point or segment `a`..`b`: around each of its samples,
+    /// each once. `None` when it takes more samples than `most` (a segment longer than a few
+    /// thousand cells: its query then scans, which is cheaper).
+    fn query_cells(&self, a: DVec2, b: DVec2, most: usize) -> Option<Vec<(i64, i64)>> {
+        let keys = sample_keys(a, b, self.cell, most)?;
+        let mut out = Vec::with_capacity(9 * keys.len());
+        for (x, y) in keys {
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    out.push((x + dx, y + dy));
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
+    /// Most samples one query takes before it scans instead: 4,096, or an eighth of the
+    /// sketch's vertices and edges when that is more.
+    fn query_most(size: usize) -> usize {
+        (size / 8).max(4096)
+    }
+
+    /// The vertices in the cells around the samples of `a`..`b` (each once: a vertex is in
+    /// one cell), or `None` for a query that scans instead.
+    fn vertices_near(
+        &self,
+        a: DVec2,
+        b: DVec2,
+        live: &SlotMap<SVertexId, DVec2>,
+        size: usize,
+    ) -> Option<Vec<SVertexId>> {
+        let cells = self.query_cells(a, b, Self::query_most(size))?;
+        let mut read = 0;
+        let out: Vec<SVertexId> = cells
+            .iter()
+            .filter_map(|c| self.verts.get(c))
+            .inspect(|l| read += l.len())
+            .flatten()
+            .copied()
+            .filter(|v| live.contains_key(*v))
+            .collect();
+        visit(read);
+        self.found(out.len(), size);
+        Some(out)
+    }
+
+    /// The edges in the cells around the samples of `a`..`b`, each once, or `None` for a
+    /// query that scans instead.
+    fn edges_near(
+        &self,
+        a: DVec2,
+        b: DVec2,
+        live: &SlotMap<SEdgeId, [SVertexId; 2]>,
+        size: usize,
+    ) -> Option<Vec<SEdgeId>> {
+        let cells = self.query_cells(a, b, Self::query_most(size))?;
+        let mut read = 0;
+        let mut out: Vec<SEdgeId> = cells
+            .iter()
+            .filter_map(|c| self.edges.get(c))
+            .inspect(|l| read += l.len())
+            .flatten()
+            .copied()
+            .filter(|e| live.contains_key(*e))
+            .collect();
+        visit(read);
+        out.sort_unstable();
+        out.dedup();
+        self.found(out.len(), size);
+        Some(out)
+    }
+
+    /// The edge joining `a` and `b`, if it is still there and still joins them.
+    fn edge_between(
+        &self,
+        a: SVertexId,
+        b: SVertexId,
+        live: &SlotMap<SEdgeId, [SVertexId; 2]>,
+    ) -> Option<SEdgeId> {
+        visit(1);
+        let e = *self.pairs.get(&(a.min(b), a.max(b)))?;
+        let [c, d] = *live.get(e)?;
+        ((c == a && d == b) || (c == b && d == a)).then_some(e)
+    }
+
+    /// Entries held (tests).
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.entries
+    }
+}
+
+/// The nearest of `vs` within the merge distance of `p`, ties to the smaller key: the
+/// scan [`Sketch::snap_with`] makes (lane 53: over every vertex, or a lookup's candidates).
+fn nearest_vertex<'a>(
+    vs: impl Iterator<Item = (SVertexId, &'a DVec2)>,
+    p: DVec2,
+) -> Option<(f64, SVertexId)> {
+    vs.map(|(k, q)| (q.distance(p), k))
+        .filter(|(d, _)| *d <= SKETCH_MERGE)
+        .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)))
+}
+
+/// The nearest of `es` within the merge distance of `p`, ties to the smaller key.
+fn nearest_edge<'a>(
+    es: impl Iterator<Item = (SEdgeId, &'a [SVertexId; 2])>,
+    vertices: &SlotMap<SVertexId, DVec2>,
+    p: DVec2,
+) -> Option<(f64, SEdgeId)> {
+    es.filter_map(|(e, [a, b])| {
+        let (pa, pb) = (vertices[*a], vertices[*b]);
+        let d = point_segment_distance(p, pa, pb);
+        (d <= SKETCH_MERGE).then_some((d, e))
+    })
+    .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)))
+}
+
+/// The vertices of `vs` (but the segment's ends `p` and `q`) within the merge distance of
+/// segment `pp`-`qq`, each with its parameter along it.
+fn on_segment<'a>(
+    vs: impl Iterator<Item = (SVertexId, &'a DVec2)>,
+    p: SVertexId,
+    q: SVertexId,
+    pp: DVec2,
+    qq: DVec2,
+    param: impl Fn(DVec2) -> f64,
+) -> Vec<(f64, SVertexId)> {
+    vs.filter(|(v, pos)| {
+        *v != p && *v != q && point_segment_distance(**pos, pp, qq) <= SKETCH_MERGE
+    })
+    .map(|(v, pos)| (param(*pos), v))
+    .collect()
+}
+
+/// The edges of `es` (but those with an end `skip` names) that properly cross segment
+/// `pp`-`qq`: each with its parameter along it and the crossing point.
+fn crossing<'a>(
+    es: impl Iterator<Item = (SEdgeId, &'a [SVertexId; 2])>,
+    vertices: &SlotMap<SVertexId, DVec2>,
+    skip: impl Fn(SVertexId) -> bool,
+    pp: DVec2,
+    qq: DVec2,
+    param: impl Fn(DVec2) -> f64,
+) -> Vec<(f64, SEdgeId, DVec2)> {
+    let mut out = Vec::new();
+    for (e, &[c, dd]) in es {
+        if skip(c) || skip(dd) {
+            continue;
+        }
+        let (pc, pd) = (vertices[c], vertices[dd]);
+        if proper_cross(pp, qq, pc, pd) {
+            let x = line_intersection(pp, qq, pc, pd);
+            out.push((param(x), e, x));
+        }
+    }
+    out
+}
+
+/// Lane 53 (#65): segments ab and cd do not cross and each end of one is more than `clear`
+/// from the other (so they are more than `clear` apart, up to rounding).
+fn segments_apart(a: DVec2, b: DVec2, c: DVec2, d: DVec2, clear: f64) -> bool {
+    !proper_cross(a, b, c, d)
+        && point_segment_distance(a, c, d) > clear
+        && point_segment_distance(b, c, d) > clear
+        && point_segment_distance(c, a, b) > clear
+        && point_segment_distance(d, a, b) > clear
+}
+
+/// Lane 53 (#65): most segments one cell of [`Sketch::edges_after_clear_polyline`]'s grid
+/// may hold before the polyline counts as too tightly packed to count cheaply.
+pub const SURE_CELL: usize = 64;
+
+/// Lane 53 (#65): the cells (side `cell`) of points sampled along segment ab at most half a
+/// cell apart, ends included, each once (every point of the segment is within a quarter cell
+/// of one); `None` when that takes more than `most` samples ([`samples`]), before anything
+/// is allocated.
+fn sample_keys(a: DVec2, b: DVec2, cell: f64, most: usize) -> Option<Vec<(i64, i64)>> {
+    let n = samples(a.distance(b), cell);
+    if n > most {
+        return None;
+    }
+    let steps = n - 1;
+    let mut out: Vec<(i64, i64)> = Vec::with_capacity(n);
+    for k in 0..=steps {
+        let p = a + (b - a) * (k as f64 / steps as f64);
+        let key = ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64);
+        if out.last() != Some(&key) {
+            out.push(key);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
 /// Intersection point of segments ab and cd (callers have established a proper crossing).
 ///
 /// The parameter along ab comes from the two robust orientations of a and b against cd:
@@ -480,6 +997,79 @@ impl PointGrid {
         }
         out.sort_unstable();
         out
+    }
+}
+
+/// #11: a stroke already in the sketch that is to become a curve (see
+/// [`Sketch::add_curve`], whose arguments these are).
+#[derive(Debug, Clone)]
+pub(crate) struct NewCurve {
+    pub pts: Vec<DVec2>,
+    pub closed: bool,
+    pub kind: CurveKind,
+    pub centre: Option<DVec2>,
+    pub segments: u32,
+}
+
+/// #11: a sketch's vertices binned in square cells twice `reach` wide, so the vertices
+/// within `reach` of a point are in its cell or the eight around it: [`Sketch::vertex_near`]
+/// for many points without a scan of every vertex per point. A point too far out for a
+/// cell number (or not finite) is scanned for, as before.
+struct VertexGrid {
+    cell: f64,
+    reach: f64,
+    bins: std::collections::HashMap<(i64, i64), Vec<SVertexId>>,
+}
+
+impl VertexGrid {
+    /// Cell numbers stay well inside `i64` (and exact in `f64`) below this.
+    const FAR: f64 = 1e15;
+
+    fn new(s: &Sketch, reach: f64) -> VertexGrid {
+        let mut g = VertexGrid {
+            cell: 2.0 * reach,
+            reach,
+            bins: std::collections::HashMap::new(),
+        };
+        for (k, p) in s.vertices() {
+            if let Some(c) = g.at(p) {
+                g.bins.entry(c).or_default().push(k);
+            }
+        }
+        visit(s.vertices.len());
+        g
+    }
+
+    fn at(&self, p: DVec2) -> Option<(i64, i64)> {
+        let q = p / self.cell;
+        (q.x.abs() < Self::FAR && q.y.abs() < Self::FAR)
+            .then(|| (q.x.floor() as i64, q.y.floor() as i64))
+    }
+
+    /// The vertex nearest `p` within the reach, ties to the smaller id: what
+    /// [`Sketch::vertex_near`] finds.
+    fn near(&self, s: &Sketch, p: DVec2) -> Option<SVertexId> {
+        let Some((x, y)) = self.at(p) else {
+            return s.vertex_near(p, self.reach);
+        };
+        let mut best: Option<(f64, SVertexId)> = None;
+        let mut read = 0;
+        for cx in x - 1..=x + 1 {
+            for cy in y - 1..=y + 1 {
+                for &k in self.bins.get(&(cx, cy)).into_iter().flatten() {
+                    read += 1;
+                    let d = s.vertices[k].distance(p);
+                    let better = best.is_none_or(|(bd, bk)| {
+                        d.total_cmp(&bd).then(k.cmp(&bk)) == std::cmp::Ordering::Less
+                    });
+                    if d <= self.reach && better {
+                        best = Some((d, k));
+                    }
+                }
+            }
+        }
+        visit(read);
+        best.map(|(_, k)| k)
     }
 }
 
@@ -898,17 +1488,182 @@ impl Sketch {
         Ok(if closed { n } else { n - 1 })
     }
 
+    /// Lane 53 (#65): the number of edges this sketch holds after inserting the polyline,
+    /// when that is certain without inserting it; `None` when it is not (or the polyline is
+    /// refused for another reason, which inserting it will say).
+    ///
+    /// It is certain for a polyline that is clear of itself and of the sketch: every segment
+    /// longer than twice the merge distance, every two segments that do not share an end more
+    /// than that apart, two that do share one each with its far end more than that from the
+    /// other, and every vertex and edge of the sketch more than that from every segment.
+    /// Then inserting it merges, splits and repairs nothing: each segment snaps to new
+    /// vertices or to the previous segment's end, no vertex lies on it and no edge crosses
+    /// it, so it adds exactly one edge, and the repair finds every rule held. The count is the
+    /// sketch's edges plus the segments. (The clearance is twice what the insertion tests, so
+    /// a rounding in these distances can only make a polyline count as not clear.)
+    ///
+    /// Segments are found near each other through a grid, so this costs about as much as the
+    /// polyline is long; a polyline packed so tightly that the grid stops being cheap (more
+    /// than [`SURE_CELL`] segments in one cell, or more cells than a budget in its length and
+    /// the sketch's) is not counted.
+    pub(crate) fn edges_after_clear_polyline(
+        &self,
+        points: &[DVec2],
+        closed: bool,
+    ) -> Option<usize> {
+        let segs = Self::polyline_segments(points, closed).ok()?;
+        if !points.iter().all(|p| p.is_finite()) {
+            return None;
+        }
+        let n = points.len();
+        let clear = 2.0 * SKETCH_MERGE;
+        let seg = |i: usize| (points[i], points[(i + 1) % n]);
+        let mut total = 0.0;
+        for i in 0..segs {
+            let (a, b) = seg(i);
+            let len = a.distance(b);
+            if len <= clear {
+                return None;
+            }
+            total += len;
+        }
+        // The cell: about the mean segment's length, and never under four clearances. Each
+        // segment is entered in the cells of its samples ([`sample_keys`]), and each lookup
+        // looks in the cells around a sample, as [`Lookup`] does: two segments (or a vertex
+        // or an edge and a segment) within the clearance of each other are then found.
+        let cell = (total / segs as f64).max(4.0 * clear);
+        // Samples along the segments and edges: a few a segment of about the mean length.
+        let mut budget = 8 * (segs + self.edges.len()) + 4096;
+        let mut grid: std::collections::HashMap<(i64, i64), Vec<u32>> =
+            std::collections::HashMap::new();
+        let mut keys_of: Vec<Vec<(i64, i64)>> = Vec::with_capacity(segs);
+        for i in 0..segs {
+            let (a, b) = seg(i);
+            let keys = sample_keys(a, b, cell, budget)?;
+            budget -= keys.len();
+            for &c in &keys {
+                let v = grid.entry(c).or_default();
+                v.push(i as u32);
+                if v.len() > SURE_CELL {
+                    return None;
+                }
+            }
+            keys_of.push(keys);
+        }
+        let around = |keys: &[(i64, i64)]| {
+            let mut out: Vec<(i64, i64)> = keys
+                .iter()
+                .flat_map(|&(x, y)| {
+                    (-1..=1).flat_map(move |dx| (-1..=1).map(move |dy| (x + dx, y + dy)))
+                })
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
+        // Segments i < j share an end when they are neighbours along the polyline: j right
+        // after i (sharing i's far end), or, closed, the last and the first (sharing the
+        // first point). (A cell holds at most SURE_CELL segments, so the pairs cost at most
+        // nine times SURE_CELL for each cell a segment takes.)
+        for (i, keys) in keys_of.iter().enumerate() {
+            let mut near: Vec<usize> = around(keys)
+                .iter()
+                .filter_map(|c| grid.get(c))
+                .flatten()
+                .map(|&j| j as usize)
+                .filter(|&j| j > i)
+                .collect();
+            near.sort_unstable();
+            near.dedup();
+            for j in near {
+                let ((a, b), (c, d)) = (seg(i), seg(j));
+                let ok = if j == i + 1 {
+                    point_segment_distance(a, c, d) > clear
+                        && point_segment_distance(d, a, b) > clear
+                } else if closed && i == 0 && j == segs - 1 {
+                    point_segment_distance(b, c, d) > clear
+                        && point_segment_distance(c, a, b) > clear
+                } else {
+                    segments_apart(a, b, c, d, clear)
+                };
+                if !ok {
+                    return None;
+                }
+            }
+        }
+        drop(keys_of);
+        // The sketch's own vertices and edges, against the segments near them: only those in
+        // the polyline's box widened by the clearance, the rest at the cost of a comparison
+        // (a stroke beside a sketch of 40,000 vertices and edges looked each up in the grid).
+        // Every vertex of a sketch ends one of its edges (`Sketch::check` refuses an isolated
+        // vertex), and each edge's ends are tested against the segments below, so this loop
+        // decides nothing alone; it keeps the test of a lone point cheap and plain.
+        let (mut lo, mut hi) = (points[0], points[0]);
+        for p in points {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        let (lo, hi) = (lo - DVec2::splat(clear), hi + DVec2::splat(clear));
+        let outside = |a: DVec2, b: DVec2| {
+            a.x.max(b.x) < lo.x || a.x.min(b.x) > hi.x || a.y.max(b.y) < lo.y || a.y.min(b.y) > hi.y
+        };
+        let key = |x: f64| (x / cell).floor() as i64;
+        for p in self.vertices.values().filter(|p| !outside(**p, **p)) {
+            for c in around(&[(key(p.x), key(p.y))]) {
+                for &i in grid.get(&c).map(Vec::as_slice).unwrap_or(&[]) {
+                    let (a, b) = seg(i as usize);
+                    if point_segment_distance(*p, a, b) <= clear {
+                        return None;
+                    }
+                }
+            }
+        }
+        for [u, w] in self.edges.values() {
+            let (c, d) = (self.vertices[*u], self.vertices[*w]);
+            if outside(c, d) {
+                continue;
+            }
+            let keys = sample_keys(c, d, cell, budget)?;
+            budget -= keys.len();
+            for k in around(&keys) {
+                for &i in grid.get(&k).map(Vec::as_slice).unwrap_or(&[]) {
+                    let (a, b) = seg(i as usize);
+                    if !segments_apart(a, b, c, d, clear) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(self.edges.len() + segs)
+    }
+
     /// Lane 16 (C3): insert many polylines as one transaction. The graph is built, repaired
     /// once and its regions detected once; an import of 5,000 lines used to copy the sketch,
     /// repair it and detect every region once per line. All or nothing: the first stroke the
     /// sketch refuses refuses them all (the caller then inserts them one at a time).
     pub fn insert_polylines(&mut self, strokes: &[(Vec<DVec2>, bool)]) -> Result<(), SketchError> {
+        self.insert_polylines_by(strokes, None)
+    }
+
+    /// [`Self::insert_polylines`], through a [`Lookup`] or with the scans (as
+    /// [`Self::with_polyline_by`]).
+    fn insert_polylines_by(
+        &mut self,
+        strokes: &[(Vec<DVec2>, bool)],
+        lookup: Option<bool>,
+    ) -> Result<(), SketchError> {
         let mut next = self.clone();
+        let all = strokes.iter().map(|(p, c)| (&p[..], *c));
+        let mut look = match lookup {
+            Some(false) => None,
+            Some(true) => Lookup::for_strokes(&next, all, 0),
+            None => Lookup::for_strokes(&next, all, LOOKUP_MIN_WORK),
+        };
         for (points, closed) in strokes {
             let segs = Self::polyline_segments(points, *closed)?;
             let n = points.len();
             for i in 0..segs {
-                next.add_segment(points[i], points[(i + 1) % n])?;
+                next.add_segment_with(points[i], points[(i + 1) % n], &mut look)?;
             }
         }
         next.repair()?;
@@ -923,18 +1678,73 @@ impl Sketch {
         points: &[DVec2],
         closed: bool,
     ) -> Result<(Sketch, Vec<(SVertexId, SVertexId)>), SketchError> {
+        self.with_polyline_by(points, closed, None)
+    }
+
+    /// [`Self::with_polyline`]: through a [`Lookup`] when the stroke is long enough for one
+    /// to pay (`None`), or (for the tests that hold the two ways to one result) always
+    /// through one (`Some(true)`) or always with the scans of every vertex and edge.
+    fn with_polyline_by(
+        &self,
+        points: &[DVec2],
+        closed: bool,
+        lookup: Option<bool>,
+    ) -> Result<(Sketch, Vec<(SVertexId, SVertexId)>), SketchError> {
+        Self::polyline_segments(points, closed)?;
+        let one = std::iter::once((points, closed));
+        let mut look = match lookup {
+            Some(false) => None,
+            Some(true) => Lookup::for_strokes(self, one, 0),
+            None => Lookup::for_strokes(self, one, LOOKUP_MIN_WORK),
+        };
+        self.with_polyline_through(points, closed, &mut look)
+    }
+
+    /// [`Self::with_polyline_by`] through `look` (`None`: the scans), which may be dropped on
+    /// the way ([`Self::looked_up`]).
+    fn with_polyline_through(
+        &self,
+        points: &[DVec2],
+        closed: bool,
+        look: &mut Option<Lookup>,
+    ) -> Result<(Sketch, Vec<(SVertexId, SVertexId)>), SketchError> {
         let segs = Self::polyline_segments(points, closed)?;
         let n = points.len();
         let mut next = self.clone();
         let mut new_edges = Vec::new();
         for i in 0..segs {
-            new_edges.extend(next.add_segment(points[i], points[(i + 1) % n])?);
+            new_edges.extend(next.add_segment_with(points[i], points[(i + 1) % n], look)?);
         }
         next.repair()?;
-        new_edges.retain(|&(a, b)| next.edge_between(a, b).is_some());
+        next.retain_live(&mut new_edges);
         next.settle();
         next.debug_check("insert");
         Ok((next, new_edges))
+    }
+
+    /// Keep the edges of `made` still there after a repair. For many (lane 53) one set of
+    /// the sketch's edges instead of a scan of them for each (`edge_between` either way round
+    /// is this pair); for a few the scans, which cost less than the set. #11: a move or copy
+    /// of everything had the scans' square here too.
+    fn retain_live(&self, made: &mut Vec<(SVertexId, SVertexId)>) {
+        if made.len() > 64 {
+            let live: std::collections::HashSet<(SVertexId, SVertexId)> = self.edge_pairs();
+            made.retain(|&(a, b)| live.contains(&(a.min(b), a.max(b))));
+        } else {
+            made.retain(|&(a, b)| self.edge_between(a, b).is_some());
+        }
+    }
+
+    /// #11: a [`Lookup`] for drawing `segs` (two-point strokes) into `self`, as
+    /// [`Self::with_polyline_by`] chooses one for a stroke: `None` (the scans) under the work
+    /// a lookup pays for, or for the tests always (`Some(true)`) or never one.
+    fn lookup_for_segments(&self, segs: &[[DVec2; 2]], lookup: Option<bool>) -> Option<Lookup> {
+        let strokes = segs.iter().map(|s| (&s[..], false));
+        match lookup {
+            Some(false) => None,
+            Some(true) => Lookup::for_strokes(self, strokes, 0),
+            None => Lookup::for_strokes(self, strokes, LOOKUP_MIN_WORK),
+        }
     }
 
     fn debug_check(&self, what: &str) {
@@ -966,41 +1776,113 @@ impl Sketch {
     }
 
     fn edge_between(&self, a: SVertexId, b: SVertexId) -> Option<SEdgeId> {
-        self.edges
+        let mut read = 0;
+        let found = self
+            .edges
             .iter()
+            .inspect(|_| read += 1)
             .find(|(_, e)| (e[0] == a && e[1] == b) || (e[0] == b && e[1] == a))
-            .map(|(k, _)| k)
+            .map(|(k, _)| k);
+        visit(read);
+        found
     }
 
     /// Split edge `e` at `pos` (which lies on it); returns the new vertex.
     fn split_edge(&mut self, e: SEdgeId, pos: DVec2) -> SVertexId {
+        self.split_edge_with(e, pos, &mut None)
+    }
+
+    /// [`Self::split_edge`], keeping `look` up to date.
+    fn split_edge_with(&mut self, e: SEdgeId, pos: DVec2, look: &mut Option<Lookup>) -> SVertexId {
         let [a, b] = self.edges[e];
         let x = self.vertices.insert(pos);
         self.edges[e] = [a, x];
-        self.edges.insert([x, b]);
+        let f = self.edges.insert([x, b]);
+        self.looked_up(look, &[x], &[e, f]);
         x
     }
 
+    /// Lane 53 (#65): tell `look` about new vertices and new or changed edges; it is dropped
+    /// (the scans of every vertex and edge take over) when that would cost past its budget.
+    fn looked_up(&self, look: &mut Option<Lookup>, verts: &[SVertexId], edges: &[SEdgeId]) {
+        if let Some(l) = look {
+            for &v in verts {
+                if !l.add_vertex(v, self.vertices[v]) {
+                    *look = None;
+                    return;
+                }
+            }
+            for &e in edges {
+                let [a, b] = self.edges[e];
+                if !l.add_edge(e, a, b, self.vertices[a], self.vertices[b]) {
+                    *look = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Lane 53 (#65): the vertices to test against the point or segment `a`..`b` when there
+    /// is a lookup: those near it, which hold every vertex within the merge distance of it
+    /// (see [`Lookup`]); `None`: test every vertex (no lookup, or a segment too long for it
+    /// to be worth looking along). Each candidate is then tested exactly as the full scan
+    /// tests it (the scan's own loop runs on `None`), and every use orders what passes by its
+    /// own total order, so the results are the full scan's.
+    fn vertex_candidates(
+        &self,
+        a: DVec2,
+        b: DVec2,
+        look: &Option<Lookup>,
+    ) -> Option<Vec<SVertexId>> {
+        let size = self.vertices.len() + self.edges.len();
+        let near = look
+            .as_ref()
+            .and_then(|l| l.vertices_near(a, b, &self.vertices, size));
+        if near.is_none() {
+            visit(self.vertices.len()); // the caller scans every vertex
+        }
+        near
+    }
+
+    /// [`Self::vertex_candidates`] for edges: those near the point or segment, which hold
+    /// every edge within the merge distance of it or crossing it.
+    fn edge_candidates(&self, a: DVec2, b: DVec2, look: &Option<Lookup>) -> Option<Vec<SEdgeId>> {
+        let size = self.vertices.len() + self.edges.len();
+        let near = look
+            .as_ref()
+            .and_then(|l| l.edges_near(a, b, &self.edges, size));
+        if near.is_none() {
+            visit(self.edges.len()); // the caller scans every edge
+        }
+        near
+    }
+
+    /// [`Self::edge_between`], through `look`'s table of vertex pairs when there is one.
+    fn edge_between_with(
+        &self,
+        a: SVertexId,
+        b: SVertexId,
+        look: &Option<Lookup>,
+    ) -> Option<SEdgeId> {
+        match look {
+            None => self.edge_between(a, b),
+            Some(l) => l.edge_between(a, b, &self.edges),
+        }
+    }
+
     /// Resolve a segment endpoint: merge into a vertex, split an edge, or make a new vertex.
-    fn snap(&mut self, p: DVec2) -> SVertexId {
-        let near = self
-            .vertices
-            .iter()
-            .map(|(k, q)| (q.distance(p), k))
-            .filter(|(d, _)| *d <= SKETCH_MERGE)
-            .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+    fn snap_with(&mut self, p: DVec2, look: &mut Option<Lookup>) -> SVertexId {
+        let near = match self.vertex_candidates(p, p, look) {
+            Some(c) => nearest_vertex(c.iter().map(|&k| (k, &self.vertices[k])), p),
+            None => nearest_vertex(self.vertices.iter(), p),
+        };
         if let Some((_, v)) = near {
             return v;
         }
-        let on_edge = self
-            .edges
-            .iter()
-            .filter_map(|(e, [a, b])| {
-                let (pa, pb) = (self.vertices[*a], self.vertices[*b]);
-                let d = point_segment_distance(p, pa, pb);
-                (d <= SKETCH_MERGE).then_some((d, e))
-            })
-            .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        let on_edge = match self.edge_candidates(p, p, look) {
+            Some(c) => nearest_edge(c.iter().map(|&e| (e, &self.edges[e])), &self.vertices, p),
+            None => nearest_edge(self.edges.iter(), &self.vertices, p),
+        };
         if let Some((_, e)) = on_edge {
             let [a, b] = self.edges[e];
             let (pa, pb) = (self.vertices[a], self.vertices[b]);
@@ -1014,23 +1896,32 @@ impl Sketch {
             if proj.distance(pb) <= SKETCH_MERGE {
                 return b;
             }
-            return self.split_edge(e, proj);
+            return self.split_edge_with(e, proj, look);
         }
-        self.vertices.insert(p)
+        let v = self.vertices.insert(p);
+        self.looked_up(look, &[v], &[]);
+        v
     }
 
     /// Insert one segment into the graph without re-detecting regions. Returns the edges it
-    /// created (pieces that already existed are not repeated).
-    fn add_segment(
+    /// created (pieces that already existed are not repeated). Things are looked up through
+    /// `look` when there is one (lane 53, #65: a long stroke's insertion scanned every vertex
+    /// and edge for each segment, so it grew with the square of the stroke; `None`: the
+    /// scans). The same tests on every candidate that can pass them, so the same sketch.
+    fn add_segment_with(
         &mut self,
         a: DVec2,
         b: DVec2,
+        look: &mut Option<Lookup>,
     ) -> Result<Vec<(SVertexId, SVertexId)>, SketchError> {
         if a.distance(b) <= SKETCH_MERGE {
             return Err(SketchError::Degenerate);
         }
-        let p = self.snap(a);
-        let q = self.snap(b);
+        if look.as_ref().is_some_and(Lookup::poor) {
+            *look = None;
+        }
+        let p = self.snap_with(a, look);
+        let q = self.snap_with(b, look);
         if p == q {
             return Err(SketchError::Degenerate);
         }
@@ -1040,32 +1931,33 @@ impl Sketch {
         let param = |x: DVec2| (x - pp).dot(d) / len2;
 
         // Existing vertices on the new segment split it.
-        let mut cuts: Vec<(f64, SVertexId)> = self
-            .vertices
-            .iter()
-            .filter(|(v, pos)| {
-                *v != p && *v != q && point_segment_distance(**pos, pp, qq) <= SKETCH_MERGE
-            })
-            .map(|(v, pos)| (param(*pos), v))
-            .collect();
+        let mut cuts: Vec<(f64, SVertexId)> = match self.vertex_candidates(pp, qq, look) {
+            Some(c) => on_segment(
+                c.iter().map(|&k| (k, &self.vertices[k])),
+                p,
+                q,
+                pp,
+                qq,
+                param,
+            ),
+            None => on_segment(self.vertices.iter(), p, q, pp, qq, param),
+        };
         let on_line: BTreeSet<SVertexId> = cuts.iter().map(|(_, v)| *v).collect();
 
         // Proper crossings split both. Edges touching the segment at a vertex were handled
         // above and cannot also cross it.
-        let mut crossings: Vec<(f64, SEdgeId, DVec2)> = Vec::new();
-        for (e, [c, dd]) in &self.edges {
-            if [*c, *dd]
-                .iter()
-                .any(|v| *v == p || *v == q || on_line.contains(v))
-            {
-                continue;
-            }
-            let (pc, pd) = (self.vertices[*c], self.vertices[*dd]);
-            if proper_cross(pp, qq, pc, pd) {
-                let x = line_intersection(pp, qq, pc, pd);
-                crossings.push((param(x), e, x));
-            }
-        }
+        let skip = |v: SVertexId| v == p || v == q || on_line.contains(&v);
+        let mut crossings: Vec<(f64, SEdgeId, DVec2)> = match self.edge_candidates(pp, qq, look) {
+            Some(c) => crossing(
+                c.iter().map(|&e| (e, &self.edges[e])),
+                &self.vertices,
+                skip,
+                pp,
+                qq,
+                param,
+            ),
+            None => crossing(self.edges.iter(), &self.vertices, skip, pp, qq, param),
+        };
         crossings.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
         // Crossings within the merge distance of each other share one vertex.
         let mut last: Option<(DVec2, SVertexId)> = None;
@@ -1093,14 +1985,15 @@ impl Sketch {
                     let [c, dd] = self.edges[e];
                     self.edges.remove(e);
                     for (u, w) in [(c, lv), (lv, dd)] {
-                        if u != w && self.edge_between(u, w).is_none() {
-                            self.edges.insert([u, w]);
+                        if u != w && self.edge_between_with(u, w, look).is_none() {
+                            let f = self.edges.insert([u, w]);
+                            self.looked_up(look, &[], &[f]);
                         }
                     }
                     lv
                 }
                 _ => {
-                    let v = self.split_edge(e, x);
+                    let v = self.split_edge_with(e, x, look);
                     cuts.push((t, v));
                     v
                 }
@@ -1116,10 +2009,11 @@ impl Sketch {
         let mut created = Vec::new();
         for w in chain.windows(2) {
             let (u, v) = (w[0], w[1]);
-            if u == v || self.edge_between(u, v).is_some() {
+            if u == v || self.edge_between_with(u, v, look).is_some() {
                 continue;
             }
-            self.edges.insert([u, v]);
+            let f = self.edges.insert([u, v]);
+            self.looked_up(look, &[], &[f]);
             created.push((u, v));
         }
         Ok(created)
@@ -1241,12 +2135,29 @@ impl Sketch {
     /// The vertex at `p` (sketch frame): the nearest one within `SKETCH_MERGE`, ties to the
     /// smaller id.
     pub fn vertex_at(&self, p: DVec2) -> Option<SVertexId> {
+        visit(self.vertices.len());
         self.vertices
             .iter()
             .map(|(k, q)| (q.distance(p), k))
             .filter(|(d, _)| *d <= SKETCH_MERGE)
             .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)))
             .map(|(_, k)| k)
+    }
+
+    /// #11: [`Self::vertex_at`] for many points, through one grid of the vertices (the
+    /// same vertex the scan finds, ties to the smaller id): a selection of every edge of 400
+    /// polylines found each of its points with a scan of every vertex.
+    pub(crate) fn vertex_finder(&self) -> impl Fn(DVec2) -> Option<SVertexId> + '_ {
+        let g = VertexGrid::new(self, SKETCH_MERGE);
+        move |p| g.near(self, p)
+    }
+
+    /// #11: every edge's vertex pair, smaller id first, for many [`Self::has_edge`] questions.
+    pub(crate) fn edge_pairs(&self) -> std::collections::HashSet<(SVertexId, SVertexId)> {
+        self.edges
+            .values()
+            .map(|&[a, b]| (a.min(b), a.max(b)))
+            .collect()
     }
 
     /// Whether an edge joins `a` and `b`.
@@ -1285,6 +2196,22 @@ impl Sketch {
         anchor: &dyn Fn(DVec2) -> DVec2,
         round: &dyn Fn(&Round) -> Option<(DVec2, f64)>,
     ) -> Result<MovedSketch, SketchError> {
+        self.with_moved_vertices_by(to, anchor, round, None)
+    }
+
+    /// [`Self::with_moved_vertices`], drawing the taken edges again through a [`Lookup`]
+    /// when there are enough for one to pay (`None`; #11: with the scans of every vertex and
+    /// edge for each edge, a move of everything grew with the square of the sketch), or (for
+    /// the tests that hold the two ways to one result) always through one (`Some(true)`) or
+    /// always with the scans. The lookup is built after the vertices have moved, so it sees
+    /// what the scans see.
+    fn with_moved_vertices_by(
+        &self,
+        to: &BTreeMap<SVertexId, DVec2>,
+        anchor: &dyn Fn(DVec2) -> DVec2,
+        round: &dyn Fn(&Round) -> Option<(DVec2, f64)>,
+        lookup: Option<bool>,
+    ) -> Result<MovedSketch, SketchError> {
         for p in to.values() {
             if !(p.is_finite() && in_bounds(p.x) && in_bounds(p.y)) {
                 return Err(SketchError::OutOfBounds);
@@ -1317,13 +2244,17 @@ impl Sketch {
                 r.anchor = anchor(r.anchor);
             }
         }
+        let strokes: Vec<[DVec2; 2]> = taken
+            .iter()
+            .map(|(_, [a, b])| [next.vertices[*a], next.vertices[*b]])
+            .collect();
+        let mut look = next.lookup_for_segments(&strokes, lookup);
         let mut made = Vec::new();
-        for (_, [a, b]) in taken {
-            let (pa, pb) = (next.vertices[a], next.vertices[b]);
+        for [pa, pb] in strokes {
             if pa.distance(pb) <= SKETCH_MERGE {
                 continue; // shrunk to nothing: its ends merge in the repair
             }
-            match next.add_segment(pa, pb) {
+            match next.add_segment_with(pa, pb, &mut look) {
                 Ok(e) => made.extend(e),
                 // Both ends snapped onto one vertex: nothing left of it.
                 Err(SketchError::Degenerate) => {}
@@ -1332,7 +2263,7 @@ impl Sketch {
         }
         next.remove_isolated_vertices();
         next.repair()?;
-        made.retain(|&(a, b)| next.edge_between(a, b).is_some());
+        next.retain_live(&mut made);
         let split = next.settle_traced();
         next.debug_check("move");
         let touched = next.live_regions_touching(&made);
@@ -1348,7 +2279,19 @@ impl Sketch {
         &self,
         segs: &[(DVec2, DVec2)],
     ) -> Result<Option<(Sketch, Vec<RegionId>)>, SketchError> {
+        self.with_segments_by(segs, None)
+    }
+
+    /// [`Self::with_segments`] through a [`Lookup`] when one pays, or always or never one
+    /// (as [`Self::with_moved_vertices_by`]; #11: Copy and Array drew with the same scans).
+    fn with_segments_by(
+        &self,
+        segs: &[(DVec2, DVec2)],
+        lookup: Option<bool>,
+    ) -> Result<Option<(Sketch, Vec<RegionId>)>, SketchError> {
         let mut next = self.clone();
+        let strokes: Vec<[DVec2; 2]> = segs.iter().map(|&(a, b)| [a, b]).collect();
+        let mut look = next.lookup_for_segments(&strokes, lookup);
         let mut made = Vec::new();
         for &(a, b) in segs {
             if !(a.is_finite() && b.is_finite())
@@ -1359,7 +2302,7 @@ impl Sketch {
             if a.distance(b) <= SKETCH_MERGE {
                 continue;
             }
-            match next.add_segment(a, b) {
+            match next.add_segment_with(a, b, &mut look) {
                 Ok(e) => made.extend(e),
                 Err(SketchError::Degenerate) => {}
                 Err(e) => return Err(e),
@@ -1369,7 +2312,7 @@ impl Sketch {
             return Ok(None);
         }
         next.repair()?;
-        made.retain(|&(a, b)| next.edge_between(a, b).is_some());
+        next.retain_live(&mut made);
         next.settle();
         next.debug_check("copy");
         let touched = next.live_regions_touching(&made);
@@ -1498,6 +2441,7 @@ impl Sketch {
 
     /// The vertex nearest `p` within `reach`, ties to the smaller id.
     fn vertex_near(&self, p: DVec2, reach: f64) -> Option<SVertexId> {
+        visit(self.vertices.len());
         self.vertices
             .iter()
             .map(|(k, q)| (q.distance(p), k))
@@ -1560,83 +2504,18 @@ impl Sketch {
         if self.curves.is_empty() {
             return split_from;
         }
-        let mut adj: BTreeMap<SVertexId, Vec<SVertexId>> = BTreeMap::new();
-        for [a, b] in self.edges.values() {
-            adj.entry(*a).or_default().push(*b);
-            adj.entry(*b).or_default().push(*a);
-        }
+        let adj = self.adjacency();
         let mut claimed: BTreeSet<(SVertexId, SVertexId)> = BTreeSet::new();
+        let none = BTreeSet::new();
         let old = std::mem::take(&mut self.curves);
         let mut next = self.next_curve;
         let mut out: BTreeMap<u64, Curve> = BTreeMap::new();
         for (id, c) in old {
-            let (pieces, lost) = self.curve_pieces(&c, &adj, &mut claimed);
-            let split = !(pieces.len() == 1 && pieces[0].1 == c.closed);
-            let mut first = true;
-            for (chain, closed) in pieces {
-                let edges = if closed { chain.len() } else { chain.len() - 1 };
-                let (kind, mut round, segments) = if lost {
-                    (CurveKind::Polyline, None, edges as u32)
-                } else if !split {
-                    (c.kind, c.round, c.segments)
-                } else {
-                    match (c.kind, closed) {
-                        (CurveKind::Circle | CurveKind::Arc, false) => {
-                            (CurveKind::Arc, c.round, edges as u32)
-                        }
-                        _ => (CurveKind::Polyline, None, edges as u32),
-                    }
-                };
-                let mut kind = kind;
-                if let Some(r) = round.as_mut() {
-                    let pts: Vec<DVec2> = chain.iter().map(|&v| self.vertices[v]).collect();
-                    // A piece whose points no longer fit its circle (a repair bent it, say a
-                    // vertex snapped onto one of its chords zigzags it) is a polyline: the
-                    // validator's rules hold for every curve settling leaves.
-                    let fits = match fit_angles(r.centre, &pts, closed) {
-                        Some((start, sweep)) => {
-                            r.start = start;
-                            r.sweep = sweep;
-                            check_round(r, &pts, closed).is_ok()
-                        }
-                        None => false,
-                    };
-                    if !fits {
-                        kind = CurveKind::Polyline;
-                        round = None;
-                    }
+            for (key, piece) in self.settle_curve(id, &c, &adj, &none, &mut claimed, &mut next) {
+                if key != id {
+                    split_from.push((key, id));
                 }
-                let segments = if kind == CurveKind::Polyline {
-                    edges as u32
-                } else {
-                    segments
-                };
-                let min = match (kind, closed) {
-                    (_, true) => 3,
-                    (CurveKind::Polyline, false) => 2,
-                    _ => 1,
-                };
-                if edges < min {
-                    continue;
-                }
-                let key = if first {
-                    first = false;
-                    id
-                } else {
-                    next += 1;
-                    split_from.push((next - 1, id));
-                    next - 1
-                };
-                out.insert(
-                    key,
-                    Curve {
-                        kind,
-                        chain,
-                        closed,
-                        segments,
-                        round,
-                    },
-                );
+                out.insert(key, piece);
             }
         }
         self.curves = out;
@@ -1644,12 +2523,108 @@ impl Sketch {
         split_from
     }
 
+    /// Each vertex's neighbours along edges.
+    fn adjacency(&self) -> BTreeMap<SVertexId, Vec<SVertexId>> {
+        let mut adj: BTreeMap<SVertexId, Vec<SVertexId>> = BTreeMap::new();
+        for [a, b] in self.edges.values() {
+            adj.entry(*a).or_default().push(*b);
+            adj.entry(*b).or_default().push(*a);
+        }
+        adj
+    }
+
+    /// One curve of [`Self::settle_curves`], `id`: its pieces, keyed by id (the first keeps
+    /// `id`, each further one takes `next`, which moves on). An edge in `held` or `claimed`
+    /// is an older curve's; the edges this curve takes go into `claimed`.
+    fn settle_curve(
+        &self,
+        id: u64,
+        c: &Curve,
+        adj: &BTreeMap<SVertexId, Vec<SVertexId>>,
+        held: &BTreeSet<(SVertexId, SVertexId)>,
+        claimed: &mut BTreeSet<(SVertexId, SVertexId)>,
+        next: &mut u64,
+    ) -> Vec<(u64, Curve)> {
+        visit(c.chain.len());
+        let mut out = Vec::new();
+        let (pieces, lost) = self.curve_pieces(c, adj, held, claimed);
+        let split = !(pieces.len() == 1 && pieces[0].1 == c.closed);
+        let mut first = true;
+        for (chain, closed) in pieces {
+            let edges = if closed { chain.len() } else { chain.len() - 1 };
+            let (kind, mut round, segments) = if lost {
+                (CurveKind::Polyline, None, edges as u32)
+            } else if !split {
+                (c.kind, c.round, c.segments)
+            } else {
+                match (c.kind, closed) {
+                    (CurveKind::Circle | CurveKind::Arc, false) => {
+                        (CurveKind::Arc, c.round, edges as u32)
+                    }
+                    _ => (CurveKind::Polyline, None, edges as u32),
+                }
+            };
+            let mut kind = kind;
+            if let Some(r) = round.as_mut() {
+                let pts: Vec<DVec2> = chain.iter().map(|&v| self.vertices[v]).collect();
+                // A piece whose points no longer fit its circle (a repair bent it, say a
+                // vertex snapped onto one of its chords zigzags it) is a polyline: the
+                // validator's rules hold for every curve settling leaves.
+                let fits = match fit_angles(r.centre, &pts, closed) {
+                    Some((start, sweep)) => {
+                        r.start = start;
+                        r.sweep = sweep;
+                        check_round(r, &pts, closed).is_ok()
+                    }
+                    None => false,
+                };
+                if !fits {
+                    kind = CurveKind::Polyline;
+                    round = None;
+                }
+            }
+            let segments = if kind == CurveKind::Polyline {
+                edges as u32
+            } else {
+                segments
+            };
+            let min = match (kind, closed) {
+                (_, true) => 3,
+                (CurveKind::Polyline, false) => 2,
+                _ => 1,
+            };
+            if edges < min {
+                continue;
+            }
+            let key = if first {
+                first = false;
+                id
+            } else {
+                *next += 1;
+                *next - 1
+            };
+            out.push((
+                key,
+                Curve {
+                    kind,
+                    chain,
+                    closed,
+                    segments,
+                    round,
+                },
+            ));
+        }
+        out
+    }
+
     /// The pieces of curve `c` in the graph as it is now (chains, closed), and whether it
-    /// lost an edge or a point. Claims the edges it keeps.
+    /// lost an edge or a point. Claims the edges it keeps; an edge in `held` or already
+    /// claimed is another curve's.
     fn curve_pieces(
         &self,
         c: &Curve,
         adj: &BTreeMap<SVertexId, Vec<SVertexId>>,
+        held: &BTreeSet<(SVertexId, SVertexId)>,
         claimed: &mut BTreeSet<(SVertexId, SVertexId)>,
     ) -> (Vec<(Vec<SVertexId>, bool)>, bool) {
         let n = c.chain.len();
@@ -1667,7 +2642,7 @@ impl Sketch {
                 p.iter().all(|&x| {
                     let k = key(prev, x);
                     prev = x;
-                    !claimed.contains(&k) && mine.insert(k)
+                    !held.contains(&k) && !claimed.contains(&k) && mine.insert(k)
                 })
             });
             match path {
@@ -1791,9 +2766,47 @@ impl Sketch {
         centre: Option<DVec2>,
         segments: u32,
     ) -> Option<(u64, Vec<u64>)> {
+        let curve = self.new_curve(pts, closed, kind, centre, segments, |p| {
+            self.vertex_near(p, 2.0 * SKETCH_MERGE)
+        })?;
+        let id = self.next_curve;
+        let before = self.curves.clone();
+        let next_before = self.next_curve;
+        self.next_curve += 1;
+        self.curves.insert(id, curve);
+        let split = self.settle_curves();
+        // The new curve's pieces must fit their circle; a stroke that does not (points the
+        // insertion moved too far) stays plain edges, never a curve that lies.
+        let mine: Vec<u64> = self.curves.keys().copied().filter(|&k| k >= id).collect();
+        let fits = mine.iter().all(|k| self.round_fits(&self.curves[k]));
+        if !fits {
+            self.curves = before;
+            self.next_curve = next_before;
+            return None;
+        }
+        let first = mine.first().copied()?;
+        let more = split
+            .iter()
+            .filter(|&&(piece, from)| from == id && piece != first)
+            .map(|&(piece, _)| piece)
+            .collect();
+        Some((first, more))
+    }
+
+    /// The curve a stroke through `pts` makes (see [`Self::add_curve`]), its points found by
+    /// `near` (the vertex within twice the merge distance); `None` when it makes none.
+    fn new_curve(
+        &self,
+        pts: &[DVec2],
+        closed: bool,
+        kind: CurveKind,
+        centre: Option<DVec2>,
+        segments: u32,
+        near: impl Fn(DVec2) -> Option<SVertexId>,
+    ) -> Option<Curve> {
         let mut chain: Vec<SVertexId> = Vec::with_capacity(pts.len());
         for &p in pts {
-            let v = self.vertex_near(p, 2.0 * SKETCH_MERGE)?;
+            let v = near(p)?;
             if chain.last() != Some(&v) {
                 chain.push(v);
             }
@@ -1819,43 +2832,89 @@ impl Sketch {
             (true, None) => return None,
             (false, _) => None,
         };
-        let id = self.next_curve;
-        let before = self.curves.clone();
-        let next_before = self.next_curve;
-        self.next_curve += 1;
-        self.curves.insert(
-            id,
-            Curve {
-                kind,
-                chain,
-                closed,
-                segments,
-                round,
-            },
-        );
-        let split = self.settle_curves();
-        // The new curve's pieces must fit their circle; a stroke that does not (points the
-        // insertion moved too far) stays plain edges, never a curve that lies.
-        let mine: Vec<u64> = self.curves.keys().copied().filter(|&k| k >= id).collect();
-        let fits = mine.iter().all(|k| {
-            let c = &self.curves[k];
-            c.round.is_none_or(|r| {
-                let at: Vec<DVec2> = c.chain.iter().map(|&v| self.vertices[v]).collect();
-                check_round(&r, &at, c.closed).is_ok()
-            })
-        });
-        if !fits {
-            self.curves = before;
-            self.next_curve = next_before;
-            return None;
+        Some(Curve {
+            kind,
+            chain,
+            closed,
+            segments,
+            round,
+        })
+    }
+
+    /// Whether [`Self::settle_curves`] would leave every curve as it is, with the same
+    /// counter: each settles to itself, one piece with its own id.
+    fn curves_settled(&self, adj: &BTreeMap<SVertexId, Vec<SVertexId>>) -> bool {
+        let none = BTreeSet::new();
+        let mut claimed = BTreeSet::new();
+        let mut next = self.next_curve;
+        self.curves.iter().all(|(&id, c)| {
+            let pieces = self.settle_curve(id, c, adj, &none, &mut claimed, &mut next);
+            matches!(pieces.as_slice(), [(k, p)] if *k == id && p == c)
+        })
+    }
+
+    /// Whether a curve's points fit its circle (a curve that is not round fits).
+    fn round_fits(&self, c: &Curve) -> bool {
+        c.round.is_none_or(|r| {
+            let at: Vec<DVec2> = c.chain.iter().map(|&v| self.vertices[v]).collect();
+            check_round(&r, &at, c.closed).is_ok()
+        })
+    }
+
+    /// #11: [`Self::add_curve`] for each of `curves` in order (an import's curves), leaving
+    /// the same sketch and returning the same ids. One at a time scanned every vertex for
+    /// each point and settled every curve in the sketch for each curve, so a file of n
+    /// curves took time in n squared. Here the points are found through one grid of the
+    /// vertices, and only the new curve is settled: the graph does not change as curves are
+    /// added, a settled curve settles again to itself, and an older curve never loses an
+    /// edge to a newer one, so what settling every curve did to the older ones was nothing.
+    /// The new curve is settled as the last of them, against the edges the others hold
+    /// once settled (its own pieces' edges, after it, never the edges of a piece it
+    /// dropped), its further pieces numbered as one at a time numbers them. A sketch whose
+    /// curves would not settle to themselves (only a hand-edited file holds one: a curve
+    /// running through a junction, say) takes them one at a time, since there the first
+    /// curve's settle changed the older ones.
+    pub(crate) fn add_curves(&mut self, curves: &[NewCurve]) -> Vec<Option<u64>> {
+        let adj = self.adjacency();
+        if !self.curves_settled(&adj) {
+            return curves
+                .iter()
+                .map(|c| self.add_curve(&c.pts, c.closed, c.kind, c.centre, c.segments))
+                .collect();
         }
-        let first = mine.first().copied()?;
-        let more = split
-            .iter()
-            .filter(|&&(piece, from)| from == id && piece != first)
-            .map(|&(piece, _)| piece)
+        let grid = VertexGrid::new(self, 2.0 * SKETCH_MERGE);
+        let key = |(a, b): (SVertexId, SVertexId)| (a.min(b), a.max(b));
+        let mut held: BTreeSet<(SVertexId, SVertexId)> = self
+            .curves
+            .values()
+            .flat_map(|c| c.pairs().map(key))
             .collect();
-        Some((first, more))
+        let mut ids = Vec::with_capacity(curves.len());
+        for c in curves {
+            let Some(curve) = self.new_curve(&c.pts, c.closed, c.kind, c.centre, c.segments, |p| {
+                grid.near(self, p)
+            }) else {
+                ids.push(None);
+                continue;
+            };
+            let id = self.next_curve;
+            let mut next = id + 1;
+            let mut taken = BTreeSet::new();
+            let pieces = self.settle_curve(id, &curve, &adj, &held, &mut taken, &mut next);
+            // The check `add_curve` makes, kept the same (a settle already makes a piece off
+            // its circle a polyline, so it holds today); a curve that kept no edge spends its id.
+            if !pieces.iter().all(|(_, p)| self.round_fits(p)) {
+                ids.push(None);
+                continue;
+            }
+            self.next_curve = next;
+            ids.push(pieces.first().map(|(k, _)| *k));
+            for (k, p) in pieces {
+                held.extend(p.pairs().map(key));
+                self.curves.insert(k, p);
+            }
+        }
+        ids
     }
 
     /// Lane 23: erase a whole curve (the Eraser on any of its segments): every edge of it
@@ -2545,6 +3604,7 @@ impl Sketch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::TAU;
 
     fn sketch() -> Sketch {
         Sketch::new(Plane::GROUND)
@@ -2883,5 +3943,1358 @@ mod tests {
             Err(SketchError::Degenerate)
         );
         assert_eq!((s.vertex_count(), s.edge_count(), s.region_count()), before);
+    }
+
+    /// #11: a small, fixed random sequence (splitmix64), so the comparison below needs no
+    /// new dependency and every seed replays.
+    struct Mix(u64);
+
+    impl Mix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// One stroke of a random import: its points and, when it is one, its curve.
+    fn random_stroke(r: &mut Mix, made: &[NewCurve], spread: f64) -> NewCurve {
+        let grid = |r: &mut Mix| v(r.below(9) as f64 * spread, r.below(9) as f64 * spread);
+        let radii = [0.003, 0.02, 0.05, 0.1, 0.25];
+        let plain = |pts: Vec<DVec2>| NewCurve {
+            pts,
+            closed: false,
+            kind: CurveKind::Polyline,
+            centre: None,
+            segments: 0,
+        };
+        match r.below(10) {
+            // Again, exactly or within the merge distance: the second one loses its edges
+            // to the first, or lands on the same points.
+            0 if !made.is_empty() => {
+                let mut c = made[r.below(made.len() as u64) as usize].clone();
+                let d = [0.0, 5e-6, 3e-5][r.below(3) as usize];
+                c.pts.iter_mut().for_each(|p| p.x += d);
+                c
+            }
+            // A circle or a polygon, sometimes square to the axes, sometimes about a centre
+            // a little off (so it does not fit).
+            0..=2 => {
+                let c = grid(r);
+                let rad = radii[r.below(5) as usize];
+                let n = [3, 4, 5, 6, 8, 12, 24, 33][r.below(8) as usize];
+                let a0 = [0.0, TAU / 8.0, r.unit() * TAU][r.below(3) as usize];
+                let pts = (0..n)
+                    .map(|k| c + rad * DVec2::from_angle(a0 + TAU * k as f64 / n as f64))
+                    .collect();
+                let off = [0.0, 0.0, 1e-5, 3e-5, 1e-3][r.below(5) as usize];
+                let kind = if r.below(3) == 0 {
+                    CurveKind::Polygon
+                } else {
+                    CurveKind::Circle
+                };
+                NewCurve {
+                    pts,
+                    closed: true,
+                    kind,
+                    centre: Some(c + v(off, 0.0)),
+                    segments: n as u32,
+                }
+            }
+            // An arc either way round, of one segment or more.
+            3 => {
+                let c = grid(r);
+                let rad = radii[r.below(5) as usize];
+                let n = [1, 1, 2, 3, 6, 16][r.below(6) as usize];
+                let a0 = r.unit() * TAU;
+                let sweep = (0.1 + r.unit() * 6.0) * if r.below(2) == 0 { 1.0 } else { -1.0 };
+                let pts = (0..=n)
+                    .map(|k| c + rad * DVec2::from_angle(a0 + sweep * k as f64 / n as f64))
+                    .collect();
+                NewCurve {
+                    pts,
+                    closed: false,
+                    kind: CurveKind::Arc,
+                    centre: Some(c),
+                    segments: n as u32,
+                }
+            }
+            // A polyline curve on the grid: open, closed, P-shaped (back to its second
+            // point) or doubled back on its last edge.
+            4 => {
+                let n = 2 + r.below(4) as usize;
+                let mut pts: Vec<DVec2> = (0..n).map(|_| grid(r)).collect();
+                let shape = r.below(4);
+                if shape == 0 && n >= 4 {
+                    pts.push(pts[1]);
+                } else if shape == 1 {
+                    pts.push(pts[n - 2]);
+                }
+                let closed = shape == 2 && n > 2;
+                let segments = if closed { pts.len() } else { pts.len() - 1 } as u32;
+                NewCurve {
+                    pts,
+                    closed,
+                    kind: CurveKind::Polyline,
+                    centre: None,
+                    segments,
+                }
+            }
+            // An arc of one or two segments over a chord of an earlier circle or polygon.
+            5 => {
+                let round: Vec<&NewCurve> = made
+                    .iter()
+                    .filter(|c| c.closed && c.centre.is_some())
+                    .collect();
+                if round.is_empty() {
+                    return plain(vec![grid(r), grid(r)]);
+                }
+                let c = round[r.below(round.len() as u64) as usize];
+                let n = c.pts.len();
+                let i = r.below(n as u64) as usize;
+                let take = 1 + r.below(2) as usize;
+                NewCurve {
+                    pts: (0..=take).map(|j| c.pts[(i + j) % n]).collect(),
+                    closed: false,
+                    kind: CurveKind::Arc,
+                    centre: c.centre,
+                    segments: take as u32,
+                }
+            }
+            // A spur from a point of an earlier stroke (a junction on it).
+            6 if !made.is_empty() => {
+                let c = &made[r.below(made.len() as u64) as usize];
+                let p = c.pts[r.below(c.pts.len() as u64) as usize];
+                plain(vec![p, grid(r) + v(0.013, 0.007) * spread])
+            }
+            // A plain line across whatever is there (no curve: segments 0).
+            _ => plain(vec![grid(r), grid(r)]),
+        }
+    }
+
+    /// Strokes into the sketch as an import puts them: all together, else one at a time
+    /// (those that go in). Returns the curves among those that went in.
+    fn insert_like_an_import(s: &mut Sketch, strokes: &[NewCurve]) -> Vec<NewCurve> {
+        let list: Vec<(Vec<DVec2>, bool)> =
+            strokes.iter().map(|c| (c.pts.clone(), c.closed)).collect();
+        let landed: Vec<bool> = if s.insert_polylines(&list).is_ok() {
+            vec![true; strokes.len()]
+        } else {
+            list.iter()
+                .map(|(p, closed)| s.insert_polyline(p, *closed).is_ok())
+                .collect()
+        };
+        strokes
+            .iter()
+            .zip(landed)
+            .filter(|(c, ok)| *ok && c.segments > 0)
+            .map(|(c, _)| c.clone())
+            .collect()
+    }
+
+    fn one_at_a_time(s: &mut Sketch, curves: &[NewCurve]) -> Vec<Option<u64>> {
+        curves
+            .iter()
+            .map(|c| s.add_curve(&c.pts, c.closed, c.kind, c.centre, c.segments))
+            .collect()
+    }
+
+    /// #11: adding an import's curves together leaves exactly what adding them one at a
+    /// time left (the same curves, ids, points and angles, the same next id, the same model
+    /// hash) and returns the same ids, over 1,000 random imports into sketches that may
+    /// hold curves already: circles, polygons, arcs (of one segment too, and over another
+    /// curve's chord) and polylines (P-shaped and doubled back too), crossing, touching,
+    /// with spurs at their points, repeated (exactly or within the merge distance), about
+    /// centres a little off, crowded or spread out. Each kind of outcome must turn up:
+    /// curves that split, curves that stay plain edges, and imports where neither happens.
+    #[test]
+    fn curves_added_together_match_curves_added_one_at_a_time() {
+        let (mut split, mut refused, mut clean) = (0, 0, 0);
+        for seed in 0..1000u64 {
+            let mut r = Mix(seed);
+            // Strokes crowded on a 0.1 grid (most cross), or spread out on a 1.0 one.
+            let spread = if seed % 2 == 0 { 0.1 } else { 1.0 };
+            let mut s = sketch();
+            // Curves already there, added one at a time as a draw adds them.
+            let mut made: Vec<NewCurve> = Vec::new();
+            for _ in 0..r.below(4) {
+                let c = random_stroke(&mut r, &made, spread);
+                if s.insert_polyline(&c.pts, c.closed).is_ok() && c.segments > 0 {
+                    s.add_curve(&c.pts, c.closed, c.kind, c.centre, c.segments);
+                }
+                made.push(c);
+            }
+            let strokes: Vec<NewCurve> = (0..2 + r.below(24))
+                .map(|_| {
+                    let c = random_stroke(&mut r, &made, spread);
+                    made.push(c.clone());
+                    c
+                })
+                .collect();
+            let curves = insert_like_an_import(&mut s, &strokes);
+            let mut a = s.clone();
+            let want = one_at_a_time(&mut a, &curves);
+            let made_ids = want.iter().flatten().count();
+            let none = want.len() - made_ids;
+            let pieces = a.curve_count() - s.curve_count();
+            refused += usize::from(none > 0);
+            split += usize::from(pieces > made_ids);
+            clean += usize::from(none == 0 && pieces == made_ids && made_ids > 0);
+            let mut b = s.clone();
+            let got = b.add_curves(&curves);
+            assert_eq!(got, want, "seed {seed}: the ids returned");
+            assert_eq!(
+                b.curves().collect::<Vec<_>>(),
+                a.curves().collect::<Vec<_>>(),
+                "seed {seed}: the curves"
+            );
+            assert_eq!(b.next_curve_id(), a.next_curve_id(), "seed {seed}");
+            assert_eq!(
+                crate::hash::sketch_hash(&b),
+                crate::hash::sketch_hash(&a),
+                "seed {seed}"
+            );
+        }
+        eprintln!("imports with a curve split {split}, with plain edges {refused}, clean {clean}");
+        assert!(split > 100, "split {split}");
+        assert!(refused > 100, "plain edges {refused}");
+        assert!(clean > 50, "clean {clean}");
+    }
+
+    /// #11: the vertex grid finds what the scan finds, ties to the smaller id included,
+    /// for points on, near, between and far from the vertices (and not finite).
+    #[test]
+    fn the_vertex_grid_finds_what_the_scan_finds() {
+        let reach = 2.0 * SKETCH_MERGE;
+        for seed in 0..400u64 {
+            let mut r = Mix(seed ^ 0x5eed);
+            let mut s = sketch();
+            for _ in 0..1 + r.below(12) {
+                let c = random_stroke(&mut r, &[], 0.1);
+                let _ = s.insert_polyline(&c.pts, c.closed);
+            }
+            let grid = VertexGrid::new(&s, reach);
+            let verts: Vec<DVec2> = s.vertices().map(|(_, p)| p).collect();
+            if verts.is_empty() {
+                continue;
+            }
+            for _ in 0..200 {
+                let base = verts[r.below(verts.len() as u64) as usize];
+                let d = [0.0, 1e-6, 1e-5, reach, reach * (1.0 + 1e-12), 2e-5, 0.3];
+                let off = d[r.below(d.len() as u64) as usize];
+                let p = base + off * DVec2::from_angle(r.unit() * TAU);
+                assert_eq!(
+                    grid.near(&s, p),
+                    s.vertex_near(p, reach),
+                    "seed {seed}, {p:?}"
+                );
+            }
+            for p in [
+                v(f64::NAN, 0.0),
+                v(f64::INFINITY, 1.0),
+                v(1e300, -1e300),
+                verts[0] + v(0.5 * reach, 0.5 * reach),
+            ] {
+                assert_eq!(grid.near(&s, p), s.vertex_near(p, reach), "{p:?}");
+            }
+        }
+    }
+
+    /// #11: a point exactly as far from two vertices (each within the reach) finds the one
+    /// with the smaller id through the grid, as the scan does, whichever vertex came first.
+    #[test]
+    fn the_vertex_grid_breaks_a_tie_to_the_smaller_id() {
+        let reach = 2.0 * SKETCH_MERGE;
+        // Powers of two, so the two distances are exactly equal: 2^-15 m apart, the point
+        // half way (2^-16 m, under the reach, from each).
+        let h = 2f64.powi(-15);
+        for flip in [false, true] {
+            let mut s = sketch();
+            let (a, b) = if flip { (h, 0.0) } else { (0.0, h) };
+            s.insert_polyline(&[v(0.0, a), v(-1.0, a)], false).unwrap();
+            s.insert_polyline(&[v(0.0, b), v(1.0, b)], false).unwrap();
+            let p = v(0.0, 0.5 * h);
+            let grid = VertexGrid::new(&s, reach);
+            let want = s.vertex_near(p, reach);
+            assert!(want.is_some());
+            assert_eq!(s.vertex(want.unwrap()).unwrap().distance(p), 0.5 * h);
+            assert_eq!(grid.near(&s, p), want, "flip {flip}");
+        }
+    }
+
+    /// #11: a sketch whose curves would not settle to themselves, as only a hand-edited
+    /// file holds (here a circle running whole through two junctions, which a settle splits
+    /// into two arcs), takes an import's curves one at a time: the same curves, ids, next id
+    /// and sketch hash as `add_curve` one at a time, the circle split as that splits it.
+    #[test]
+    fn curves_added_to_a_sketch_a_file_left_unsettled_match_one_at_a_time() {
+        let n = 12;
+        let ring: Vec<DVec2> = (0..n)
+            .map(|k| 0.1 * DVec2::from_angle(TAU * k as f64 / n as f64))
+            .collect();
+        let mut s = sketch();
+        s.insert_polyline(&ring, true).unwrap();
+        // Two spurs of two segments out from opposite points: junctions there.
+        for k in [0, 6] {
+            s.insert_polyline(&[ring[k], 1.5 * ring[k], 2.0 * ring[k]], false)
+                .unwrap();
+        }
+        // On a settled sketch the circle is two arcs at once.
+        let mut drawn = s.clone();
+        drawn
+            .add_curve(&ring, true, CurveKind::Circle, Some(DVec2::ZERO), n as u32)
+            .unwrap();
+        assert_eq!(drawn.curve_count(), 2);
+        // The file a hand edit leaves: the same circle as one curve, which opens.
+        let chain: Vec<SVertexId> = ring.iter().map(|&p| s.vertex_at(p).unwrap()).collect();
+        let at: Vec<DVec2> = chain.iter().map(|&k| s.vertices[k]).collect();
+        let (start, sweep) = fit_angles(DVec2::ZERO, &at, true).unwrap();
+        s.curves.insert(
+            1,
+            Curve {
+                kind: CurveKind::Circle,
+                chain,
+                closed: true,
+                segments: n as u32,
+                round: Some(Round {
+                    centre: DVec2::ZERO,
+                    radius: 0.1,
+                    start,
+                    sweep,
+                }),
+            },
+        );
+        s.next_curve = 2;
+        let s = Sketch::from_raw(Plane::GROUND, &s.to_raw()).unwrap();
+        assert!(!s.curves_settled(&s.adjacency()));
+        // An import's curves: a polyline along one spur, and an arc on three of the
+        // circle's points, which loses its edges to the circle.
+        let curves = vec![
+            NewCurve {
+                pts: vec![ring[6], 1.5 * ring[6], 2.0 * ring[6]],
+                closed: false,
+                kind: CurveKind::Polyline,
+                centre: None,
+                segments: 2,
+            },
+            NewCurve {
+                pts: ring[1..=3].to_vec(),
+                closed: false,
+                kind: CurveKind::Arc,
+                centre: Some(DVec2::ZERO),
+                segments: 2,
+            },
+        ];
+        let mut a = s.clone();
+        let want = one_at_a_time(&mut a, &curves);
+        let mut b = s.clone();
+        assert_eq!(b.add_curves(&curves), want);
+        assert_eq!(
+            b.curves().collect::<Vec<_>>(),
+            a.curves().collect::<Vec<_>>()
+        );
+        assert_eq!(b.next_curve_id(), a.next_curve_id());
+        assert_eq!(crate::hash::sketch_hash(&b), crate::hash::sketch_hash(&a));
+        // The circle is two arcs, as the first curve's settle left it.
+        let arcs = b
+            .curves()
+            .filter(|(_, c)| c.kind == CurveKind::Arc && c.round.is_some_and(|r| r.radius == 0.1))
+            .count();
+        assert_eq!(arcs, 2, "{:?}", b.curves().collect::<Vec<_>>());
+    }
+}
+
+/// Lane 53 (#65): a stroke inserted through the [`Lookup`] leaves exactly the sketch the scans
+/// of every vertex and edge leave (the same vertices and edges under the same keys, the same
+/// regions and curves, the same new edges), on hostile strokes and sketches.
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::f64::consts::TAU;
+
+    /// Everything a sketch holds, keys and bits included.
+    fn fingerprint(s: &Sketch) -> String {
+        let v: Vec<_> = s
+            .vertices
+            .iter()
+            .map(|(k, p)| (k, p.x.to_bits(), p.y.to_bits()))
+            .collect();
+        let e: Vec<_> = s.edges.iter().collect();
+        format!(
+            "{v:?}\n{e:?}\n{:?}\n{:?}\n{}",
+            s.regions, s.curves, s.next_curve
+        )
+    }
+
+    /// A stroke: `n` points from `start`, each step `len` long in direction `a`, turning by
+    /// `turn` a step; `kind` sends some steps back onto an earlier point (exactly, or within
+    /// or just past the merge distance), along a segment already drawn, or folding back.
+    fn stroke(
+        start: DVec2,
+        steps: &[(f64, f64, u8, f64)],
+        scale: f64,
+        existing: &[DVec2],
+    ) -> Vec<DVec2> {
+        let mut p = start;
+        let mut a = 0.0f64;
+        let mut pts = vec![p];
+        for &(len, turn, kind, r) in steps {
+            a += turn;
+            let pick = |m: usize| (a.abs() * 997.0) as usize % m.max(1);
+            p = match kind {
+                0 => pts[pick(pts.len())] + DVec2::from_angle(a * 3.0) * r,
+                1 if !existing.is_empty() => {
+                    existing[pick(existing.len())] + DVec2::from_angle(a) * r
+                }
+                2 => {
+                    let back = pts[pts.len().saturating_sub(2)];
+                    if back == p {
+                        p + DVec2::from_angle(a) * len * scale
+                    } else {
+                        let along = back - p;
+                        back + along * 0.5 + along.perp().normalize() * r
+                    }
+                }
+                _ => p + DVec2::from_angle(a) * len * scale,
+            };
+            pts.push(p);
+        }
+        pts
+    }
+
+    fn step() -> impl Strategy<Value = (f64, f64, u8, f64)> {
+        (
+            prop_oneof![
+                Just(1e-5),
+                Just(1.0e-5 + 2e-9),
+                Just(2e-5),
+                Just(1e-4),
+                1e-3f64..2e-2,
+                Just(0.5),
+            ],
+            prop_oneof![-0.4f64..0.4, -3.2f64..3.2],
+            0u8..12,
+            prop_oneof![
+                Just(0.0),
+                Just(5e-6),
+                Just(1e-5),
+                Just(1.0e-5 + 2e-9),
+                Just(1.5e-5),
+                Just(3e-5)
+            ],
+        )
+    }
+
+    /// A sketch: rectangles, a long diagonal (more cells than a lookup will take, at the
+    /// small steps), and a stroke already there, all near the origin or `far` out.
+    fn base(rects: &[(f64, f64, f64, f64)], diagonal: bool, far: f64, old: &[DVec2]) -> Sketch {
+        let mut s = Sketch::new(Plane::GROUND);
+        let o = DVec2::splat(far);
+        for &(x, y, w, h) in rects {
+            let _ = s.add_rectangle(o + DVec2::new(x, y), DVec2::new(w, h));
+        }
+        if diagonal {
+            let _ = s.insert_polyline(
+                &[o + DVec2::new(-20.0, -19.0), o + DVec2::new(20.0, 21.0)],
+                false,
+            );
+        }
+        if old.len() >= 2 {
+            let pts: Vec<DVec2> = old.iter().map(|&p| p + o).collect();
+            let _ = s.insert_polyline(&pts, false);
+        }
+        s
+    }
+
+    fn case() -> impl Strategy<Value = (Sketch, Vec<Vec<DVec2>>, Vec<bool>)> {
+        (
+            prop::collection::vec(
+                (
+                    -0.05f64..0.05,
+                    -0.05f64..0.05,
+                    0.001f64..0.06,
+                    0.001f64..0.06,
+                ),
+                0..3,
+            ),
+            any::<bool>(),
+            prop_oneof![Just(0.0), Just(-3.3), Just(9000.0)],
+            prop::collection::vec(step(), 0..80),
+            prop::collection::vec(
+                (
+                    prop::collection::vec(step(), 1..300),
+                    -0.05f64..0.05,
+                    -0.05f64..0.05,
+                    any::<bool>(),
+                    prop_oneof![Just(1.0), Just(0.1), Just(5.0)],
+                ),
+                1..4,
+            ),
+        )
+            .prop_map(|(rects, diagonal, far, old_steps, strokes)| {
+                let old = stroke(DVec2::ZERO, &old_steps, 1.0, &[]);
+                let s = base(&rects, diagonal, far, &old);
+                let there: Vec<DVec2> = s.vertices.values().copied().collect();
+                let o = DVec2::splat(far);
+                let mut all = Vec::new();
+                let mut closed = Vec::new();
+                for (steps, x, y, c, scale) in strokes {
+                    all.push(stroke(o + DVec2::new(x, y), &steps, scale, &there));
+                    closed.push(c);
+                }
+                (s, all, closed)
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 400, ..ProptestConfig::default() })]
+        #[test]
+        fn a_stroke_through_the_lookup_is_the_stroke_scanned((s, strokes, closed) in case()) {
+            for (pts, &c) in strokes.iter().zip(&closed) {
+                let fast = s.with_polyline_by(pts, c, Some(true));
+                let slow = s.with_polyline_by(pts, c, Some(false));
+                match (fast, slow) {
+                    (Ok((a, ea)), Ok((b, eb))) => {
+                        prop_assert_eq!(fingerprint(&a), fingerprint(&b));
+                        prop_assert_eq!(ea, eb);
+                    }
+                    (a, b) => prop_assert_eq!(a.err(), b.err()),
+                }
+            }
+            let list: Vec<(Vec<DVec2>, bool)> =
+                strokes.iter().cloned().zip(closed.iter().copied()).collect();
+            let (mut a, mut b) = (s.clone(), s.clone());
+            let (ra, rb) = (
+                a.insert_polylines_by(&list, Some(true)),
+                b.insert_polylines_by(&list, Some(false)),
+            );
+            prop_assert_eq!(&ra, &rb);
+            if ra.is_ok() {
+                prop_assert_eq!(fingerprint(&a), fingerprint(&b));
+            }
+        }
+    }
+
+    /// #11: a sketch to move or copy from: [`case`]'s sketch and strokes drawn, and circles
+    /// of 6 to 48 segments as curves, some on the strokes and rectangles.
+    fn moving_case() -> impl Strategy<Value = (Sketch, u8, (f64, f64, f64, f64))> {
+        (
+            case(),
+            prop::collection::vec(
+                (-0.05f64..0.05, -0.05f64..0.05, 0.002f64..0.03, 6usize..49),
+                0..6,
+            ),
+            0u8..6,
+            prop_oneof![
+                // A shift anywhere near, or exactly the merge distance (or a hair past it),
+                // or a rectangle's width, so moved edges weld, split and merge.
+                (-0.06f64..0.06, -0.06f64..0.06, Just(0.0), Just(1.0)),
+                Just((1e-5, 0.0, 0.0, 1.0)),
+                Just((1.0e-5 + 2e-9, 0.0, 0.0, 1.0)),
+                (0.001f64..0.06).prop_map(|w| (w, 0.0, 0.0, 1.0)),
+                // A turn or a scale about the origin.
+                (-3.2f64..3.2).prop_map(|a| (0.0, 0.0, a, 1.0)),
+                (0.25f64..3.0).prop_map(|k| (0.0, 0.0, 0.0, k)),
+            ],
+        )
+            .prop_map(|((mut s, strokes, closed), circles, pick, map)| {
+                for (pts, c) in strokes.iter().zip(&closed) {
+                    let _ = s.insert_polyline(pts, *c);
+                }
+                let o = s.vertices.values().next().copied().unwrap_or(DVec2::ZERO);
+                for (x, y, r, n) in circles {
+                    let c = o + DVec2::new(x, y);
+                    let ring: Vec<DVec2> = (0..n)
+                        .map(|k| c + r * DVec2::from_angle(TAU * k as f64 / n as f64))
+                        .collect();
+                    if s.insert_polyline(&ring, true).is_ok() {
+                        s.add_curve(&ring, true, CurveKind::Circle, Some(c), n as u32);
+                    }
+                }
+                (s, pick, map)
+            })
+    }
+
+    /// The map `(dx, dy, turn, scale)` of [`moving_case`] about `o`.
+    fn mapped(p: DVec2, o: DVec2, (dx, dy, turn, k): (f64, f64, f64, f64)) -> DVec2 {
+        o + DVec2::from_angle(turn).rotate(p - o) * k + DVec2::new(dx, dy)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..ProptestConfig::default() })]
+        /// #11: a move's edges drawn again through a lookup leave exactly the sketch the
+        /// scans leave (keys and bits included), the same regions and the same curve pieces:
+        /// every vertex moved, or one in two to six of them (some edges then stretch between
+        /// a moved and a still end).
+        #[test]
+        fn a_move_through_the_lookup_is_the_move_scanned((s, pick, map) in moving_case()) {
+            let o = s.vertices.values().next().copied().unwrap_or(DVec2::ZERO);
+            let to: BTreeMap<SVertexId, DVec2> = s
+                .vertices
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| pick == 0 || i % (pick as usize + 1) == 0)
+                .map(|(_, (k, &p))| (k, mapped(p, o, map)))
+                .collect();
+            let anchor = |q: DVec2| mapped(q, o, map);
+            let round = |c: &Round| Some((mapped(c.centre, o, map), c.radius * map.3));
+            let fast = s.with_moved_vertices_by(&to, &anchor, &round, Some(true));
+            let slow = s.with_moved_vertices_by(&to, &anchor, &round, Some(false));
+            match (fast, slow) {
+                (Ok((a, ta, sa)), Ok((b, tb, sb))) => {
+                    prop_assert_eq!(fingerprint(&a), fingerprint(&b));
+                    prop_assert_eq!(ta, tb);
+                    prop_assert_eq!(sa, sb);
+                }
+                (a, b) => prop_assert_eq!(a.err(), b.err()),
+            }
+        }
+
+        /// #11: a copy's segments (the sketch's edges mapped, as Copy and Array draw them)
+        /// drawn through a lookup leave exactly the sketch the scans leave.
+        #[test]
+        fn a_copy_through_the_lookup_is_the_copy_scanned((s, pick, map) in moving_case()) {
+            let o = s.vertices.values().next().copied().unwrap_or(DVec2::ZERO);
+            let segs: Vec<(DVec2, DVec2)> = s
+                .edges
+                .values()
+                .enumerate()
+                .filter(|(i, _)| pick == 0 || i % (pick as usize + 1) == 0)
+                .map(|(_, &[a, b])| {
+                    (mapped(s.vertices[a], o, map), mapped(s.vertices[b], o, map))
+                })
+                .collect();
+            let fast = s.with_segments_by(&segs, Some(true));
+            let slow = s.with_segments_by(&segs, Some(false));
+            match (fast, slow) {
+                (Ok(Some((a, ta))), Ok(Some((b, tb)))) => {
+                    prop_assert_eq!(fingerprint(&a), fingerprint(&b));
+                    prop_assert_eq!(ta, tb);
+                }
+                (a, b) => prop_assert_eq!(
+                    a.map(|r| r.map(|(_, t)| t)),
+                    b.map(|r| r.map(|(_, t)| t))
+                ),
+            }
+        }
+    }
+
+    /// #11: the selection's points found through one grid are the points [`Sketch::vertex_at`]
+    /// finds, at the merge distance and either side of it, and on a tie between two vertices.
+    #[test]
+    fn the_vertex_finder_finds_what_vertex_at_finds() {
+        let mut s = Sketch::new(Plane::GROUND);
+        let _ = s.add_rectangle(DVec2::new(0.0, 0.0), DVec2::new(0.01, 0.02));
+        let _ = s.insert_polyline(&[DVec2::new(-0.3, 0.1), DVec2::new(0.4, -0.2)], false);
+        let find = s.vertex_finder();
+        let near: Vec<DVec2> = s.vertices.values().copied().collect();
+        for p in near {
+            for d in [0.0, 0.5e-5, 1e-5, 1.0e-5 + 1e-12, 2e-5] {
+                for a in [0.0, 0.7, 1.9, 3.1, 4.4] {
+                    let q = p + d * DVec2::from_angle(a);
+                    assert_eq!(find(q), s.vertex_at(q), "{q:?}");
+                }
+            }
+        }
+        // Exactly between two vertices 1.5e-5 apart: a tie, to the smaller id.
+        let mut t = Sketch::new(Plane::GROUND);
+        let _ = t.insert_polyline(&[DVec2::new(0.0, 0.0), DVec2::new(1.5e-5, 0.0)], false);
+        let mid = DVec2::new(0.75e-5, 0.0);
+        assert!(t.vertex_at(mid).is_some());
+        assert_eq!(t.vertex_finder()(mid), t.vertex_at(mid));
+    }
+
+    /// #11: [`Sketch::retain_live`] keeps what [`Sketch::edge_between`] finds, in order,
+    /// through the set (over 64 pairs) as through the scans: every edge given either way
+    /// round, beside pairs of vertices with no edge between them.
+    #[test]
+    fn retain_live_keeps_the_edges_either_way_round() {
+        let mut s = Sketch::new(Plane::GROUND);
+        for i in 0..12 {
+            let c = DVec2::new(0.1 * i as f64, 0.0);
+            let ring: Vec<DVec2> = (0..8)
+                .map(|k| c + 0.03 * DVec2::from_angle(TAU * k as f64 / 8.0))
+                .collect();
+            let _ = s.insert_polyline(&ring, true);
+        }
+        let ids: Vec<SVertexId> = s.vertices.keys().collect();
+        let mut pairs: Vec<(SVertexId, SVertexId)> = Vec::new();
+        for (k, e) in s.edges.values().enumerate() {
+            // Both ways round, and a pair with no edge (a vertex and one far along the list).
+            pairs.push(if k % 2 == 0 {
+                (e[0], e[1])
+            } else {
+                (e[1], e[0])
+            });
+            pairs.push((e[1], ids[(k * 7 + 3) % ids.len()]));
+        }
+        assert!(pairs.len() > 64);
+        let scanned = |list: &[(SVertexId, SVertexId)]| -> Vec<(SVertexId, SVertexId)> {
+            list.iter()
+                .copied()
+                .filter(|&(a, b)| s.edge_between(a, b).is_some())
+                .collect()
+        };
+        let want = scanned(&pairs);
+        assert!(
+            want.len() >= s.edges.len(),
+            "{} {}",
+            want.len(),
+            s.edges.len()
+        );
+        assert!(want.iter().any(|&(a, b)| a > b) && want.iter().any(|&(a, b)| a < b));
+        let mut many = pairs.clone();
+        s.retain_live(&mut many);
+        assert_eq!(many, want, "over 64 pairs");
+        let mut few = pairs[..64].to_vec();
+        s.retain_live(&mut few);
+        assert_eq!(few, scanned(&pairs[..64]), "64 pairs");
+    }
+}
+
+/// Lane 53 (#65): [`Sketch::edges_after_clear_polyline`], the count of a stroke's edges that
+/// is certain before it is inserted: which strokes it counts, and that a count it gives is
+/// the count inserting gives.
+#[cfg(test)]
+mod sure_count_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The issue's stroke: an open zigzag, a millimetre a step.
+    fn zigzag(n: usize) -> Vec<[f64; 3]> {
+        (0..n)
+            .map(|k| [0.001 * k as f64, 0.0005 * (k % 2) as f64, 0.0])
+            .collect()
+    }
+
+    /// A random walk in the sketch's frame: half of them hostile (steps of a few sizes in any
+    /// direction, sometimes back over itself, sometimes within the merge distance of where it
+    /// has been), half gentle (steps of 1 to 20 mm, now and then 50 mm, turning by up to 45
+    /// degrees, now and then jumping to near a point it has been at or folding back past the
+    /// point before, at distances either side of the merge distance and the clearance).
+    fn walk() -> impl Strategy<Value = (Vec<DVec2>, bool)> {
+        prop_oneof![hostile_walk(), gentle_walk()]
+    }
+
+    fn gentle_walk() -> impl Strategy<Value = (Vec<DVec2>, bool)> {
+        (
+            prop::collection::vec(
+                (
+                    prop_oneof![8 => 0.001f64..0.02, 1 => Just(0.05)],
+                    -0.8f64..0.8,
+                    0u8..40,
+                    prop_oneof![
+                        Just(0.0),
+                        Just(5e-6),
+                        Just(1.5e-5),
+                        Just(2.05e-5),
+                        Just(3e-5),
+                        Just(1e-4)
+                    ],
+                ),
+                1..60,
+            ),
+            any::<bool>(),
+            -0.05f64..0.05,
+            -0.05f64..0.05,
+            0.0f64..std::f64::consts::TAU,
+        )
+            .prop_map(|(steps, closed, x, y, a0)| {
+                let mut p = DVec2::new(x, y);
+                let mut a = a0;
+                let mut pts = vec![p];
+                for (len, turn, kind, r) in steps {
+                    a += turn;
+                    let back = pts[pts.len().saturating_sub(2)];
+                    p = match kind {
+                        0 => {
+                            pts[(a.abs() * 1000.0) as usize % pts.len()]
+                                + DVec2::from_angle(a * 7.0) * r
+                        }
+                        // Folding back past the point before, `r` beside the segment it left.
+                        1 if back != p => {
+                            let along = back - p;
+                            back + along * 0.5 + along.perp().normalize() * r
+                        }
+                        _ => p + DVec2::from_angle(a) * len,
+                    };
+                    pts.push(p);
+                }
+                (pts, closed)
+            })
+    }
+
+    fn hostile_walk() -> impl Strategy<Value = (Vec<DVec2>, bool)> {
+        (
+            prop::collection::vec(
+                (
+                    prop_oneof![
+                        Just(1e-5),
+                        Just(2.5e-5),
+                        Just(1e-4),
+                        Just(1e-3),
+                        0.0f64..0.05
+                    ],
+                    0.0f64..std::f64::consts::TAU,
+                    0u8..8,
+                ),
+                1..120,
+            ),
+            any::<bool>(),
+            -0.05f64..0.05,
+            -0.05f64..0.05,
+        )
+            .prop_map(|(steps, closed, x, y)| {
+                let mut p = DVec2::new(x, y);
+                let mut pts = vec![p];
+                for (len, a, kind) in steps {
+                    p = match kind {
+                        // Back to a point already there, or within the merge distance of it.
+                        0 => pts[(a * 1000.0) as usize % pts.len()],
+                        1 => pts[(a * 1000.0) as usize % pts.len()] + DVec2::from_angle(a) * 1e-5,
+                        _ => p + DVec2::from_angle(a) * len,
+                    };
+                    pts.push(p);
+                }
+                (pts, closed)
+            })
+    }
+
+    /// A sketch with up to three rectangles, near the walk's start or across it.
+    fn sketch_with(rects: &[(f64, f64, f64, f64)]) -> Sketch {
+        let mut s = Sketch::new(Plane::GROUND);
+        for &(x, y, w, h) in rects {
+            let _ = s.add_rectangle(DVec2::new(x, y), DVec2::new(w, h));
+        }
+        s
+    }
+
+    /// Up to three rectangles, among the walks or (half the time) a metre away.
+    fn rects() -> impl Strategy<Value = Vec<(f64, f64, f64, f64)>> {
+        (
+            prop::collection::vec(
+                (
+                    -0.06f64..0.06,
+                    -0.06f64..0.06,
+                    0.001f64..0.05,
+                    0.001f64..0.05,
+                ),
+                0..3,
+            ),
+            any::<bool>(),
+        )
+            .prop_map(|(r, away)| {
+                let dx = if away { 1.0 } else { 0.0 };
+                r.into_iter()
+                    .map(|(x, y, w, h)| (x + dx, y, w, h))
+                    .collect()
+            })
+    }
+
+    /// One case: when the count is said to be certain, inserting the stroke gives exactly that
+    /// count. Returns whether it was said.
+    fn certain_is_exact(pts: &[DVec2], closed: bool, rects: &[(f64, f64, f64, f64)]) -> bool {
+        let s = sketch_with(rects);
+        let sure = s.edges_after_clear_polyline(pts, closed);
+        let mut t = s.clone();
+        let r = t.insert_polyline(pts, closed);
+        if let Some(n) = sure {
+            assert!(
+                r.is_ok(),
+                "{r:?} for {pts:?} closed {closed} beside {rects:?}"
+            );
+            assert_eq!(
+                t.edge_count(),
+                n,
+                "{pts:?} closed {closed} beside {rects:?}"
+            );
+        }
+        sure.is_some()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
+        /// Whenever the count is said to be certain, inserting the stroke gives exactly that
+        /// count (random seed; `PROPTEST_CASES` for longer runs).
+        #[test]
+        fn a_certain_count_is_the_count((pts, closed) in walk(), rects in rects()) {
+            certain_is_exact(&pts, closed, &rects);
+        }
+    }
+
+    /// The same on a fixed seed, counting: both answers come up often (so the property above is
+    /// not passing by never being sure).
+    #[test]
+    fn a_certain_count_is_the_count_on_a_fixed_seed() {
+        use proptest::strategy::ValueTree;
+        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        let (mut sure, mut not) = (0, 0);
+        for _ in 0..3000 {
+            let ((pts, closed), rects) = (walk(), rects()).new_tree(&mut runner).unwrap().current();
+            if certain_is_exact(&pts, closed, &rects) {
+                sure += 1;
+            } else {
+                not += 1;
+            }
+        }
+        println!("certain {sure}, not certain {not}");
+        assert!(sure >= 300 && not >= 300, "sure {sure}, not {not}");
+    }
+
+    /// The shapes the count is certain for, and the ones it is not.
+    #[test]
+    fn which_strokes_are_counted() {
+        let empty = sketch_with(&[]);
+        let zig: Vec<DVec2> = zigzag(500).iter().map(|p| DVec2::new(p[0], p[1])).collect();
+        assert_eq!(empty.edges_after_clear_polyline(&zig, false), Some(499));
+        // Next to a rectangle far away: its 4 edges and the stroke's.
+        let far = sketch_with(&[(-1.0, -1.0, 0.4, 0.1)]);
+        assert_eq!(far.edges_after_clear_polyline(&zig, false), Some(503));
+        // Closed square ring.
+        let sq = [
+            DVec2::new(0.0, 0.0),
+            DVec2::new(1.0, 0.0),
+            DVec2::new(1.0, 1.0),
+            DVec2::new(0.0, 1.0),
+        ];
+        assert_eq!(empty.edges_after_clear_polyline(&sq, true), Some(4));
+        // Across the rectangle, on its edge, within the clearance of it: not counted.
+        let across = sketch_with(&[(0.1, -0.01, 0.01, 0.02)]);
+        assert_eq!(across.edges_after_clear_polyline(&zig, false), None);
+        let on = sketch_with(&[(0.0, 0.0005 + 1.5 * SKETCH_MERGE, 0.5, 0.01)]);
+        assert_eq!(on.edges_after_clear_polyline(&zig, false), None);
+        // Folding back over itself, crossing itself, a step under twice the merge distance.
+        let back = [DVec2::ZERO, DVec2::new(1.0, 0.0), DVec2::new(0.5, 1e-6)];
+        assert_eq!(empty.edges_after_clear_polyline(&back, false), None);
+        let cross = [
+            DVec2::ZERO,
+            DVec2::new(1.0, 1.0),
+            DVec2::new(1.0, 0.0),
+            DVec2::new(0.0, 1.0),
+        ];
+        assert_eq!(empty.edges_after_clear_polyline(&cross, false), None);
+        let short = [
+            DVec2::ZERO,
+            DVec2::new(1.5 * SKETCH_MERGE, 0.0),
+            DVec2::new(1.0, 0.0),
+        ];
+        assert_eq!(empty.edges_after_clear_polyline(&short, false), None);
+        // Too few points, a point out of bounds.
+        assert_eq!(empty.edges_after_clear_polyline(&sq[..1], false), None);
+        assert_eq!(
+            empty.edges_after_clear_polyline(&[DVec2::ZERO, DVec2::new(2e4, 0.0)], false),
+            None
+        );
+        // Thousands of segments packed into one spot: not counted (no cheap way to be sure).
+        let packed: Vec<DVec2> = (0..5000)
+            .map(|k| DVec2::from_angle(k as f64 * 2.4) * 0.01)
+            .collect();
+        assert_eq!(empty.edges_after_clear_polyline(&packed, false), None);
+    }
+}
+
+/// Lane 53 (#65): what a [`Lookup`] costs, beside edges much longer than the stroke's
+/// segments, and that a lookup dropped on the way leaves what the scans leave.
+#[cfg(test)]
+mod lookup_cost_tests {
+    use super::*;
+
+    /// `k` parallel lines `len` long, 1 cm apart, inserted as one import.
+    fn lines(k: usize, len: f64) -> Sketch {
+        let mut s = Sketch::new(Plane::GROUND);
+        let ls: Vec<(Vec<DVec2>, bool)> = (0..k)
+            .map(|i| {
+                let y = i as f64 * 0.01;
+                (vec![DVec2::new(0.0, y), DVec2::new(len, y)], false)
+            })
+            .collect();
+        s.insert_polylines(&ls).unwrap();
+        s
+    }
+
+    /// A zigzag of `n` segments of about 0.5 mm, a metre below the lines.
+    fn zig(n: usize, y: f64) -> Vec<DVec2> {
+        (0..=n)
+            .map(|i| DVec2::new(i as f64 * 0.0005, y + (i % 2) as f64 * 0.0001))
+            .collect()
+    }
+
+    fn fingerprint(s: &Sketch) -> String {
+        let v: Vec<_> = s
+            .vertices
+            .iter()
+            .map(|(k, p)| (k, p.x.to_bits(), p.y.to_bits()))
+            .collect();
+        let e: Vec<_> = s.edges.iter().collect();
+        format!("{v:?}\n{e:?}\n{:?}", s.regions)
+    }
+
+    /// The review's case: 2,000 lines of 1 m and a stroke of 1,000 segments of 0.5 mm. With
+    /// a cell of the stroke's segment the lines alone need 4,000 samples each, 8 million in
+    /// all (what the lookup before this took, up to its budget, before it gave up); the
+    /// lookup is decided before anything is built, and holds no more than its ceiling all
+    /// the way through, and the stroke goes in exactly as with the scans.
+    #[test]
+    fn long_edges_beside_a_short_stroke_stay_under_the_ceiling() {
+        let s = lines(2000, 1.0);
+        let pts = zig(1000, -1.0);
+        let size = s.vertices.len() + s.edges.len();
+        let ceiling = lookup_ceiling(size, 1000);
+        let at_stroke_cell: usize = s
+            .edges
+            .values()
+            .map(|[a, b]| samples(s.vertices[*a].distance(s.vertices[*b]), 0.0005))
+            .sum();
+        assert!(at_stroke_cell > 20 * ceiling, "{at_stroke_cell} {ceiling}");
+        let mut look = Lookup::for_strokes(&s, std::iter::once((&pts[..], false)), 0);
+        if let Some(l) = &look {
+            assert!(l.entries() <= ceiling, "{} > {ceiling}", l.entries());
+        }
+        let fast = s.with_polyline_through(&pts, false, &mut look).unwrap();
+        if let Some(l) = &look {
+            assert!(l.entries() <= ceiling, "{} > {ceiling}", l.entries());
+        }
+        let slow = s.with_polyline_by(&pts, false, Some(false)).unwrap();
+        assert_eq!(fingerprint(&fast.0), fingerprint(&slow.0));
+        assert_eq!(fast.1, slow.1);
+    }
+
+    /// Lines of 1 m and a stroke of 3,000 short segments packed into one of their cells: the
+    /// lookup is built (with the lines' cell), the stroke crowds that cell past an eighth of
+    /// all it holds, the lookup is dropped half way and the scans finish: the same sketch.
+    #[test]
+    fn a_lookup_crowded_on_the_way_is_dropped_and_changes_nothing() {
+        let s = lines(200, 1.0);
+        let pts = zig(1500, 0.5005);
+        let mut look = Lookup::for_strokes(&s, std::iter::once((&pts[..], false)), 0);
+        assert!(look.is_some(), "a lookup is worth building here");
+        let fast = s.with_polyline_through(&pts, false, &mut look).unwrap();
+        assert!(look.is_none(), "dropped on the way");
+        let slow = s.with_polyline_by(&pts, false, Some(false)).unwrap();
+        assert_eq!(fingerprint(&fast.0), fingerprint(&slow.0));
+        assert_eq!(fast.1, slow.1);
+    }
+
+    /// A lookup whose ceiling runs out part way through a stroke (forced here: room for ten
+    /// more entries) is dropped there, and the stroke goes in exactly as with the scans.
+    #[test]
+    fn a_lookup_out_of_room_part_way_is_dropped_and_changes_nothing() {
+        // The rectangle clear of the stroke, so nothing splits: running out of room is the
+        // only way the lookup can be dropped here.
+        let mut s = Sketch::new(Plane::GROUND);
+        s.add_rectangle(DVec2::new(-0.01, -1.0), DVec2::new(0.3, 0.0002))
+            .unwrap();
+        let pts = zig(600, 0.0);
+        // Cells of 2 mm: four of the stroke's points to a cell, none crowded.
+        let mut look = Lookup::build(&s, 0.002, usize::MAX);
+        let l = look.as_mut().unwrap();
+        l.ceiling = l.entries() + 10;
+        let fast = s.with_polyline_through(&pts, false, &mut look).unwrap();
+        assert!(look.is_none(), "dropped on the way");
+        let slow = s.with_polyline_by(&pts, false, Some(false)).unwrap();
+        assert_eq!(fingerprint(&fast.0), fingerprint(&slow.0));
+        assert_eq!(fast.1, slow.1);
+    }
+
+    /// A query along a segment far longer than the cells scans instead of taking a cell per
+    /// sample: nothing is allocated for it (a 10 km segment in cells of 0.5 mm would be 40
+    /// million samples).
+    #[test]
+    fn a_very_long_query_scans_instead() {
+        let s = Sketch::new(Plane::GROUND);
+        let pts = zig(1000, 0.0);
+        let l = Lookup::for_strokes(&s, std::iter::once((&pts[..], false)), 0).unwrap();
+        let (a, b) = (DVec2::new(-5000.0, 0.0), DVec2::new(5000.0, 0.0));
+        assert!(sample_keys(a, b, l.cell, 4096).is_none());
+        assert!(l.query_cells(a, b, Lookup::query_most(0)).is_none());
+        assert!(l.vertices_near(a, b, &s.vertices, 0).is_none());
+        assert!(l.edges_near(a, b, &s.edges, 0).is_none());
+        // A short one is looked up.
+        let c = DVec2::new(0.001, 0.0);
+        assert!(
+            l.query_cells(DVec2::ZERO, c, Lookup::query_most(0))
+                .is_some()
+        );
+    }
+}
+
+/// Lane 53 (#65): the lookup against the scans where it is easiest to get wrong: steps of one
+/// to a few merge distances, so the cell is its floor (four merge distances), with every point
+/// hugging a cell border (on it, a rounding either side, or a fraction of the merge distance
+/// either side), beside short edges that hug the same borders. Any cell a lookup forgot, a
+/// neighbour ring it dropped or samples spaced too far apart lose a candidate the scans find,
+/// and the sketch comes out different (keys included).
+#[cfg(test)]
+mod lookup_border_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::strategy::ValueTree;
+
+    fn fingerprint(s: &Sketch) -> String {
+        let v: Vec<_> = s
+            .vertices
+            .iter()
+            .map(|(k, p)| (k, p.x.to_bits(), p.y.to_bits()))
+            .collect();
+        let e: Vec<_> = s.edges.iter().collect();
+        format!("{v:?}\n{e:?}\n{:?}", s.regions)
+    }
+
+    /// The cell a lookup takes for steps this short.
+    const CELL: f64 = 4.0 * SKETCH_MERGE;
+
+    /// A point on the lattice of half cells (`i`, `j`: every other line a cell border), so a
+    /// step is shorter than a cell and the cell its floor, moved by one of the offsets that
+    /// matter: none, a rounding, a fraction of the merge distance, or about one.
+    fn hug(i: i32, j: i32, dx: u8, dy: u8) -> DVec2 {
+        const OFF: [f64; 8] = [0.0, 1e-13, -1e-13, 0.2, -0.2, 0.45, -0.45, 0.9];
+        DVec2::new(
+            i as f64 * 0.5 * CELL + OFF[dx as usize % 8] * SKETCH_MERGE,
+            j as f64 * 0.5 * CELL + OFF[dy as usize % 8] * SKETCH_MERGE,
+        )
+    }
+
+    /// A walk over the lattice half a cell a step, and edges already there: most half a cell
+    /// long, some two to twelve cells long, along a border or across the cells.
+    fn case() -> impl Strategy<Value = (Vec<DVec2>, Vec<(DVec2, DVec2)>)> {
+        (
+            prop::collection::vec((-1i32..=1, -1i32..=1, any::<u8>(), any::<u8>()), 48..160),
+            prop::collection::vec(
+                (
+                    -6i32..6,
+                    -6i32..6,
+                    -1i32..=1,
+                    -1i32..=1,
+                    any::<u8>(),
+                    any::<u8>(),
+                    prop_oneof![Just(1i32), 4i32..24],
+                ),
+                0..24,
+            ),
+            -3i32..3,
+            -3i32..3,
+            (any::<bool>(), 8i32..60, any::<u8>()),
+        )
+            .prop_map(|(steps, old, i0, j0, (along, k, off))| {
+                let (mut i, mut j) = (i0, j0);
+                let mut pts = vec![hug(i, j, 0, 0)];
+                for (di, dj, dx, dy) in steps {
+                    let (di, dj) = if di == 0 && dj == 0 { (1, 0) } else { (di, dj) };
+                    i += di;
+                    j += dj;
+                    pts.push(hug(i, j, dx, dy));
+                }
+                let mut old: Vec<(DVec2, DVec2)> = old
+                    .into_iter()
+                    .map(|(a, b, di, dj, dx, dy, k)| {
+                        // Mostly one step, sometimes a long edge along or across the cells.
+                        let (di, dj) = if di == 0 && dj == 0 { (0, 1) } else { (di, dj) };
+                        (hug(a, b, dx, dy), hug(a + k * di, b + k * dj, dy, dx))
+                    })
+                    .collect();
+                if along {
+                    // A long edge on a cell border, and the stroke running along it under
+                    // the merge distance away: every point of the stroke needs that edge
+                    // found, wherever it falls between the edge's samples.
+                    old.push((hug(i0, j0, 0, 0), hug(i0 + k, j0, 0, 0)));
+                    pts = (0..k)
+                        .map(|t| {
+                            hug(i0, j0, 0, 0)
+                                + DVec2::new(
+                                    (t as f64 + 0.3) * 0.5 * CELL,
+                                    if (t + off as i32) % 2 == 0 {
+                                        0.45
+                                    } else {
+                                        -0.45
+                                    } * SKETCH_MERGE,
+                                )
+                        })
+                        .collect();
+                }
+                (pts, old)
+            })
+    }
+
+    /// One case: the stroke through a lookup and through the scans leave the same sketch,
+    /// keys included, or both refuse it the same way. The lookup takes the cell it picks, or
+    /// (`floor`) the smallest cell, whose borders the points hug whatever the edges' lengths.
+    fn same_both_ways(pts: &[DVec2], old: &[(DVec2, DVec2)], floor: bool) {
+        let mut s = Sketch::new(Plane::GROUND);
+        for &(a, b) in old {
+            let _ = s.insert_polyline(&[a, b], false);
+        }
+        if floor {
+            let mut look = Lookup::build(&s, Lookup::floor(), usize::MAX);
+            assert!(look.is_some());
+            let fast = s.with_polyline_through(pts, false, &mut look);
+            let slow = s.with_polyline_by(pts, false, Some(false));
+            match (fast, slow) {
+                (Ok((a, ea)), Ok((b, eb))) => {
+                    assert_eq!(fingerprint(&a), fingerprint(&b), "{pts:?} beside {old:?}");
+                    assert_eq!(ea, eb);
+                }
+                (a, b) => assert_eq!(a.err(), b.err()),
+            }
+            return;
+        }
+        let short: Vec<(DVec2, DVec2)> = old
+            .iter()
+            .copied()
+            .filter(|(a, b)| a.distance(*b) < CELL)
+            .collect();
+        let mut s = Sketch::new(Plane::GROUND);
+        for &(a, b) in &short {
+            let _ = s.insert_polyline(&[a, b], false);
+        }
+        let old = &short[..];
+        let look = Lookup::for_strokes(&s, std::iter::once((pts, false)), 0);
+        if let Some(l) = &look {
+            assert!(
+                l.cell < 1.25 * CELL,
+                "a cell near its floor here: {}",
+                l.cell
+            );
+        }
+        let fast = s.with_polyline_by(pts, false, Some(true));
+        let slow = s.with_polyline_by(pts, false, Some(false));
+        match (fast, slow) {
+            (Ok((a, ea)), Ok((b, eb))) => {
+                assert_eq!(fingerprint(&a), fingerprint(&b), "{pts:?} beside {old:?}");
+                assert_eq!(ea, eb);
+            }
+            (a, b) => assert_eq!(a.err(), b.err()),
+        }
+    }
+
+    /// On a fixed seed, in every `cargo test`, half the cases at the cell the lookup picks
+    /// (short edges only) and half at the smallest cell (long edges too). Planted faults in
+    /// the lookup are caught here: a dropped neighbour column, a cell under the merge
+    /// distance, edges looked up without their neighbour ring, samples four times too far
+    /// apart.
+    #[test]
+    fn strokes_hugging_cell_borders_on_a_fixed_seed() {
+        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        for k in 0..400 {
+            let (pts, old) = case().new_tree(&mut runner).unwrap().current();
+            same_both_ways(&pts, &old, k % 2 == 1);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 200, ..ProptestConfig::default() })]
+        /// The same on a random seed (`PROPTEST_CASES` for longer runs).
+        #[test]
+        fn strokes_hugging_cell_borders((pts, old) in case(), floor in any::<bool>()) {
+            same_both_ways(&pts, &old, floor);
+        }
+    }
+}
+
+/// Lane 53 (#65): when a lookup is built, and the arithmetic of its samples.
+#[cfg(test)]
+mod lookup_decision_tests {
+    use super::*;
+
+    fn circles(n: usize) -> Sketch {
+        let mut s = Sketch::new(Plane::GROUND);
+        let st: Vec<(Vec<DVec2>, bool)> = (0..n)
+            .map(|i| {
+                let c = DVec2::new((i % 40) as f64 * 0.1, (i / 40) as f64 * 0.1);
+                let ring = (0..24)
+                    .map(|k| c + DVec2::from_angle(std::f64::consts::TAU * k as f64 / 24.0) * 0.04)
+                    .collect();
+                (ring, true)
+            })
+            .collect();
+        s.insert_polylines(&st).unwrap();
+        s
+    }
+
+    fn zig(segs: usize, y: f64) -> Vec<DVec2> {
+        (0..=segs)
+            .map(|i| DVec2::new(i as f64 * 0.001, y + (i % 2) as f64 * 0.0005))
+            .collect()
+    }
+
+    fn decided(s: &Sketch, pts: &[DVec2]) -> bool {
+        Lookup::for_strokes(s, std::iter::once((pts, false)), LOOKUP_MIN_WORK).is_some()
+    }
+
+    /// Beside 400 circles a stroke of 47 segments scans and one of 48 or 512 is looked up;
+    /// a stroke beside 250 lines 0.52 m long, 3 mm apart, of 128 segments of 0.5 mm scans
+    /// (a lookup there would find most of the lines in every query), one of 2,048 does not.
+    #[test]
+    fn a_lookup_is_built_only_where_it_pays() {
+        let s = circles(400);
+        assert!(!decided(&s, &zig(47, -1.0)));
+        assert!(decided(&s, &zig(48, -1.0)));
+        assert!(decided(&s, &zig(512, -1.0)));
+        let mut l = Sketch::new(Plane::GROUND);
+        let lines: Vec<(Vec<DVec2>, bool)> = (0..250)
+            .map(|j| {
+                let x = j as f64 * 0.003;
+                (vec![DVec2::new(x, 0.0), DVec2::new(x, 0.52)], false)
+            })
+            .collect();
+        l.insert_polylines(&lines).unwrap();
+        let near = |segs: usize| -> Vec<DVec2> {
+            (0..=segs)
+                .map(|q| DVec2::new(0.0005 * q as f64 + 0.0007, -0.05 + 0.0004 * (q % 2) as f64))
+                .collect()
+        };
+        assert!(!decided(&l, &near(128)));
+        assert!(decided(&l, &near(2048)));
+    }
+
+    /// A query that comes back with more than a quarter of a sketch of 4,096 or more is
+    /// counted as poor, and a lookup with [`LOOKUP_POOR`] of them is dropped at the next
+    /// segment, the stroke going in as with the scans.
+    #[test]
+    fn a_lookup_finding_most_of_the_sketch_is_dropped() {
+        let s = circles(200);
+        let pts = zig(200, -1.0);
+        let l = Lookup::for_strokes(&s, std::iter::once((&pts[..], false)), 0).unwrap();
+        l.found(100, 4000);
+        l.found(1000, 9600);
+        assert_eq!(l.poor.get(), 0, "a small sketch, or a quarter or less");
+        for _ in 0..LOOKUP_POOR {
+            assert!(!l.poor());
+            l.found(2401, 9600);
+        }
+        assert!(l.poor());
+        let mut look = Some(l);
+        let fast = s.with_polyline_through(&pts, false, &mut look).unwrap();
+        assert!(look.is_none(), "dropped");
+        let slow = s.with_polyline_by(&pts, false, Some(false)).unwrap();
+        assert_eq!(format!("{:?}", fast.0.edges), format!("{:?}", slow.0.edges));
+        assert_eq!(fast.1, slow.1);
+    }
+
+    /// The samples of a segment never overflow a 32-bit `usize` (wasm32): a segment far over
+    /// 86 km in the smallest cells takes as many as `u32::MAX`, never wraps to a few.
+    #[test]
+    fn samples_fit_a_32_bit_usize() {
+        let max = u32::MAX as usize;
+        let cell = Lookup::floor();
+        for len in [9.0e4, 1.0e5, 2.0e4 * 1.0e4, 1e300, f64::INFINITY, f64::NAN] {
+            assert_eq!(samples_within(len, cell, max), max, "{len}");
+        }
+        for len in [0.0, 1e-5, 0.5, 1.0e3] {
+            assert_eq!(samples_within(len, cell, max), samples(len, cell));
+            assert!(samples(len, cell) >= 2);
+        }
+        // Just under and over what 32 bits hold.
+        let at = |steps: f64| samples_within(steps * 0.5 * cell, cell, max);
+        assert_eq!(at(4.0e9), 4_000_000_002);
+        assert_eq!(at(4.3e9), max);
     }
 }

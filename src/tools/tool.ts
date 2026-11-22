@@ -67,8 +67,9 @@ export const EMPTY_VIEW: ToolView = { overlay: [], marker: null, labels: [], box
 export interface InferContext {
   /** The gesture's start point: axis, parallel and perpendicular inferences run from it. */
   start?: V3;
-  /** Directions not to offer as lines through `start` (a lock keeps them): a rectangle's far
-   * corner on its own sides would have no width. */
+  /** Directions not to offer as lines through `start`, nor through a "from point" anchor (a
+   * lock keeps them): a rectangle's far corner on its own sides would have no width, and on
+   * blue through an earlier corner it stood the rectangle up (#9). */
   skipStartLines?: V3[];
   /** Points to project: snaps are made on this plane (a face being drawn on). */
   plane?: { origin: V3; normal: V3 } | null;
@@ -149,6 +150,12 @@ export abstract class Tool {
   }
   /** Forget the current gesture. */
   reset(): void {}
+  /** The model changed other than by this tool's own step (Undo, Redo, another model in this
+   * one's place, Delete, #85, or an edit from outside the tool that removed or hid something
+   * or changed what is selected, #111): drop what was worked out from the model as it was (#76).
+   * Called after `reset`, with the host already answering for the model and the selection as
+   * they are now. */
+  modelChanged(): void {}
   /** A gesture is in progress (Esc cancels it instead of clearing the selection). */
   busy(): boolean {
     return false;

@@ -452,6 +452,9 @@ export interface DocState {
   /** The drawing style and the sun (null: the defaults). */
   style?: Style | null;
   shadows?: Shadows | null;
+  /** #100: the nest settings stored now (written as a nesting's `settings`), which the
+   * Nesting pane lays a change over; its last nesting lags 200 ms behind Undo and Redo. */
+  nest_settings?: NestSettings;
 }
 
 /** A material as the Materials pane shows it (crates/wasm-api `MaterialInfo`). */
@@ -713,7 +716,8 @@ export interface InferQuery {
   dir: V3;
   px: PixelModel;
   start?: V3 | null;
-  /** Directions not to offer as lines through `start` (a lock keeps them). */
+  /** Directions not to offer as lines through `start`, nor through a "from point" anchor
+   * (#9; a lock keeps them). */
   start_skip?: V3[];
   plane?: { origin: V3; normal: V3   /** Lane 15: the pick may be a soft or hidden edge (the Eraser with Ctrl+Shift). */
   soft?: boolean;
@@ -1163,6 +1167,9 @@ export interface NestSettings {
   algorithm: NestAlgorithm;
   /** #49: the width each glue joint costs (metres); absent at the default, 1/8 in. */
   jointLoss?: number;
+  /** #57: the narrowest a glue-up's last strip is left (metres), never more than half the
+   * board; absent: 1 1/2 in, or a quarter of the board when that is less. */
+  minStrip?: number;
 }
 
 export interface StockLibrary {

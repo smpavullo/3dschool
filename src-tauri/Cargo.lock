@@ -3193,14 +3193,17 @@ dependencies = [
 
 [[package]]
 name = "sawhorse-close-guard"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.7"
 
 [[package]]
 name = "sawhorse-desktop"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.7"
 dependencies = [
+ "gio",
+ "glib",
  "sawhorse-close-guard",
  "sawhorse-device-key",
+ "sawhorse-logout-hold",
  "sawhorse-safe-save",
  "sawhorse-start-file",
  "sawhorse-window-title",
@@ -3215,7 +3218,7 @@ dependencies = [
 
 [[package]]
 name = "sawhorse-device-key"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.7"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -3226,16 +3229,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sawhorse-logout-hold"
+version = "0.1.0-alpha.7"
+
+[[package]]
 name = "sawhorse-safe-save"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.7"
 
 [[package]]
 name = "sawhorse-start-file"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.7"
 
 [[package]]
 name = "sawhorse-window-title"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.7"
 
 [[package]]
 name = "schemars"

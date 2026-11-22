@@ -2,7 +2,8 @@ import { flushSync } from "react-dom";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TopBar, type MenuItem } from "./components/TopBar";
 import { DemoBanner } from "./components/DemoBanner";
-import { isWebDemo, RELEASES_URL, REPO_URL, sitePage } from "./lib/site";
+import { isWebDemo } from "./lib/site";
+import { helpLinks, openLink } from "./lib/help";
 import { ToolRail } from "./components/ToolRail";
 import { Viewport, type KernelState, type ViewportPointer } from "./components/Viewport";
 import { SidePanel, type PaneId } from "./components/SidePanel";
@@ -12,7 +13,7 @@ import { NestingSection } from "./components/NestingSection";
 import { StockDialog } from "./components/StockDialog";
 import { nestingPdf } from "./nesting/booklet";
 import { DXF_TYPE, nestingDxf, type DxfFlavour } from "./nesting/dxf";
-import { fineU, pieceTitle } from "./nesting/format";
+import { builtInStockText, fineU, pieceTitle } from "./nesting/format";
 import { pieceFileName, pieceSvg, SVG_TYPE } from "./nesting/svg";
 import { grainOverlay } from "./cutlist/arrows";
 import { csvBytes, CSV_TYPE } from "./cutlist/csv";
@@ -29,7 +30,7 @@ import type { DocState, Entity, KernelOp, MeshData, SceneData, V3 } from "./kern
 import { describeTarget, nextTarget, type Target } from "./lib/edit";
 import { entityKey, eraseOps, partsOf, selectionHighlight, selectionLookup, withHover } from "./lib/entities";
 import { thumbnailUrl } from "./lib/thumbnail";
-import { contextTrail, describeNode, entityShown, graphIndex, graphOf, nodeById, objectParent, quoted, scopeEntity, solidsIn } from "./lib/scope";
+import { contextTrail, describeNode, entityShown, graphIndex, graphOf, hidSomething, nodeById, objectParent, quoted, scopeEntity, solidsIn } from "./lib/scope";
 import { meshIndex } from "./lib/meshIndex";
 import { isMac, quitLabel } from "./lib/platform";
 import { describe } from "./tools/select";
@@ -56,7 +57,7 @@ import { annotationView } from "./lib/annotations";
 import { InferenceMemory, kernelResolver, ToolDriver } from "./tools/driver";
 import { friendlyError, setNameSource } from "./lib/names";
 import { explodeOps } from "./lib/curves";
-import { autosaveEnabled, clearAutosave, clearOffered, describeAutosave, loadOffered, logIsWorth, MAX_AUTOSAVE_BYTES, saveAutosave, takeAutosave, worthRestoring, type Autosave } from "./lib/autosave";
+import { adoptOffered, autosaveEnabled, clearAutosave, clearOffered, describeAutosave, droppedNote, loadOffered, logIsWorth, MAX_AUTOSAVE_BYTES, olderNote, saveAutosave, setAside, takeAutosaves, type Offer } from "./lib/autosave";
 import { ALL_EXTENSIONS, askYesNo, extensionOf, IMPORT_TYPES, isTauri, onTauriDrop, pickFile, readBrowserFile, saveFile, SHZ, stem, takeTauriPaths, type FileHandle, type PickedFile } from "./io/files";
 import { closeHandler, desktopShell, discardQuestion } from "./io/closing";
 import { notOpenedNote, openLabel, startupOrder, takeStartupFile, waitingNote } from "./io/startup";
@@ -326,7 +327,13 @@ export function App() {
   // export and import errors that carry them) name things by public id, which people never
   // see (src/lib/names.ts).
   const setMessage = useCallback((m: Message) => setMessageRaw(m && m.error ? { ...m, text: friendlyError(m.text) } : m), []);
-  /** After undo / redo: the active tool's gesture is void and the measurements box shows its default again. */
+  /** After undo / redo, when another model takes this one's place (New, Close, Open, the
+   * unsaved work restored), after Delete erased the selection (#85), and after an edit from
+   * outside the tool that removed or hid something, or changed what is selected (#111: the
+   * Outliner's Delete, Explode Curve, Make Group, Make Component and Explode, and the
+   * Outliner's eye, Edit > Hide, a tag, a scene or Close Group when they hide something or
+   * take something out of the selection): the active tool's gesture is void, what it worked out from the model is stale (#76), and
+   * the measurements box shows its default again. */
   const afterHistoryRef = useRef<() => void>(() => undefined);
   const [selection, setSelection] = useState<Entity[]>([]);
   const [hover, setHover] = useState<Entity | null>(null);
@@ -393,6 +400,10 @@ export function App() {
   const [nestOpen, setNestOpen] = useState<boolean>(loadNestOpen);
   const nestShown = cutOpen && nestOpen;
   const [nesting, setNesting] = useState<Nesting | null>(null);
+  /** #56: the scene `nesting` was worked out for, so the cut list's glue-up notes come only
+   * from a nesting of the model as it is (not one kept from before an edit, or from before
+   * the section was closed and opened again). */
+  const [nestScene, setNestScene] = useState<unknown>(null);
   const [nestProblem, setNestProblem] = useState<string | null>(null);
   const [nestBusy, setNestBusy] = useState(false);
   const [nestHover, setNestHover] = useState<Entity | null>(null);
@@ -453,8 +464,19 @@ export function App() {
 
   // ---- dev autosave (IndexedDB): the op log after every edit; offered back on reload ----
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** An autosave found at load and not yet restored or discarded (also on the Edit menu). */
-  const [pendingRestore, setPendingRestore] = useState<Autosave | null>(null);
+  /** Lane 64 (#94): the unsaved work set aside and not yet restored or discarded, the one to
+   * offer first at the front (newest first at start; on the Edit menu while any is there). The
+   * state is for what is drawn, the ref for the answers. */
+  const [offers, setOffersRaw] = useState<Offer[]>([]);
+  const offersRef = useRef<Offer[]>([]);
+  const setOffers = useCallback((o: Offer[]) => {
+    offersRef.current = o;
+    setOffersRaw(o);
+  }, []);
+  /** Said once, with the first offer, when the start deleted the oldest work (MAX_OFFERS). */
+  const droppedRef = useRef("");
+  /** The log length of a new empty model (set at start): a restored model is unsaved. */
+  const emptyLogLen = useRef<number | null>(null);
   /** Lane 16: said once per model when its history is too large to autosave. */
   const autosaveTooLarge = useRef(false);
   /** Lane 16: the log hash of the model as last saved, opened or started new. While the
@@ -614,12 +636,10 @@ export function App() {
 
   // Lane 37 (#45): the file the desktop app was started with, while it waits for the answer to
   // "Restore unsaved work?" (src/io/startup.ts): Restore offers it beside the restored work,
-  // Discard opens it. The state is for the offer's text, the ref for the answers.
-  const [startupWaiting, setStartupWaitingRaw] = useState<string | null>(null);
+  // Discard opens it. (Lane 64: the offer's text is written when it is shown, so a ref is all.)
   const startupWaitingRef = useRef<string | null>(null);
   const setStartupWaiting = useCallback((path: string | null) => {
     startupWaitingRef.current = path;
-    setStartupWaitingRaw(path);
   }, []);
   /** The waiting start-up file, no longer waiting. */
   const takeStartupWaiting = useCallback(() => {
@@ -630,19 +650,80 @@ export function App() {
   /** Opens a start-up file the way a dropped file opens (set below, where that is defined). */
   const openStartupRef = useRef<(path: string) => Promise<void>>(async () => {});
 
+  /** The status line's offer of the front piece of set-aside work (`before` goes first). */
+  const showOffer = useCallback(
+    (before = "") => {
+      const list = offersRef.current;
+      const a = list[0];
+      if (!a) return;
+      const usable = a.state === "ok";
+      const path = startupWaitingRef.current;
+      const notes = [list.length > 1 ? olderNote(list.length - 1) : "", droppedRef.current, path ? waitingNote(path) : ""].filter(Boolean);
+      const after = notes.length ? ` ${notes.join(" ")}` : "";
+      setMessage({
+        text: `${before}${usable ? `Restore unsaved work? ${describeAutosave(a)}.` : `Unsaved work was kept in this browser, but ${describeAutosave(a)}; it is set aside, not loaded.`}${after}`,
+        error: !usable,
+        offer: true,
+        actions: usable
+          ? [
+              { label: "Restore", run: () => restoreRef.current(a) },
+              { label: "Discard", run: () => discardRef.current(a) },
+            ]
+          : [{ label: "Discard", run: () => discardRef.current(a) }],
+      });
+    },
+    [setMessage],
+  );
+
   const restore = useCallback(
-    (a: Autosave) => {
+    (a: Offer) => {
       const k = kernelRef.current;
-      if (!k) return;
-      setPendingRestore(null);
+      // Answered already (a second click): nothing to restore twice.
+      if (!k || !offersRef.current.some((o) => o.id === a.id)) return;
+      // Off the list at once, before the queue gets to it.
+      droppedRef.current = "";
+      setOffers(offersRef.current.filter((o) => o.id !== a.id));
       editsPending.current++;
       const next = queue.current.then(async () => {
+        // Lane 64 (#94): the model open now goes, so unsaved work in it is set aside first,
+        // as one more offer, at the back of the list: the offer line and the Edit menu take the
+        // front, so every other set comes back before this one (the next start orders by time).
+        // Nothing to keep when it is as it was started, saved or opened, or holds no work.
+        // An autosave still waiting is not needed: the log below is what it would write. Were it to
+        // run during the replay, it would write that same log to `current`, which the move into
+        // `current` below then replaces (and a start keeps one of two exact copies).
+        if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+        autosaveTimer.current = null;
+        const ops = k.logTexts();
+        const clean = cleanLogHash.current !== null && live.current.scene?.state.log_hash === cleanLogHash.current;
+        let kept: Offer | null = null;
+        if (!clean && logIsWorth(ops)) {
+          kept = await setAside(k.logJson(), { savedAt: Date.now(), solids: live.current.scene?.state.stats.objects ?? 0, steps: ops.length, worth: true });
+          // Too large to keep, or storage failed: the question File > Open asks.
+          if (!kept && !(await askYesNo(discardQuestion()))) {
+            setOffers([a, ...offersRef.current]);
+            return;
+          }
+        }
         try {
           // The log goes to the kernel as the text it was kept as (lane 16).
-          const json = await loadOffered();
+          const json = await loadOffered(a.id);
           if (json === null) throw new Error("the unsaved work kept in this browser cannot be read");
           const s = await k.replay(json);
-          void clearOffered();
+          // The restored work is this session's now: its offer becomes this session's autosave.
+          await adoptOffered(a.id);
+          // The sets the Edit menu restores before this model: those it can load (it skips
+          // the unreadable and the too large).
+          const others = offersRef.current.filter((o) => o.state === "ok").length;
+          if (kept) setOffers([...offersRef.current, kept]);
+          // An untitled model, as at start: Save never writes it over the file that was open.
+          if (docNameRef.current !== null) {
+            pluginsRef.current?.documentOpened(null);
+            setDocName(null);
+          }
+          fileHandle.current = undefined;
+          cleanLogHash.current = null;
+          setSavedLogLen(emptyLogLen.current);
           live.current.scene = s;
           setNameSource(s.state, s.mesh);
           setScene(s);
@@ -650,7 +731,8 @@ export function App() {
           setTarget(null);
           live.current.selection = [];
           setSelection([]);
-          const restored = `Restored your unsaved work: ${s.state.stats.objects} solid${s.state.stats.objects === 1 ? "" : "s"}, ${a.steps} steps (undo works as before).`;
+          afterHistoryRef.current();
+          const restored = `Restored your unsaved work: ${s.state.stats.objects} solid${s.state.stats.objects === 1 ? "" : "s"}, ${a.steps} steps (undo works as before).${kept ? ` The model you had open is set aside as unsaved work: Edit > Restore Unsaved Work brings it back${others ? ` after ${others === 1 ? "1 other set" : `${others} other sets`}` : ""}.` : ""}`;
           // A start-up file was waiting for this answer: it is offered, not opened, so the
           // restored work stays in front of the person, and opening it asks about the work.
           const waiting = takeStartupWaiting();
@@ -659,24 +741,42 @@ export function App() {
           setFitSeq((n) => n + 1);
           scheduleAutosave();
         } catch (err) {
-          // Kept aside, still offered: Discard removes it.
-          setPendingRestore({ ...a, state: "unreadable" });
-          setMessage({ text: `Could not restore the unsaved work: ${friendlyError(err instanceof Error ? err.message : String(err))}`, error: true, actions: [{ label: "Discard", run: () => discardRef.current() }] });
+          // Kept aside, still offered: Discard removes it. The open model is as it was (a
+          // refused log leaves the kernel's document alone), so what was set aside of it goes
+          // back to being this session's autosave, kept once; it stays an offer only if
+          // storage fails to move it.
+          const broken: Offer = { ...a, state: "unreadable" };
+          const back = kept ? await adoptOffered(kept.id) : true;
+          setOffers([broken, ...offersRef.current, ...(kept && !back ? [kept] : [])]);
+          setMessage({ text: `Could not restore the unsaved work: ${friendlyError(err instanceof Error ? err.message : String(err))}`, error: true, offer: true, actions: [{ label: "Discard", run: () => discardRef.current(broken) }] });
         }
       });
       void next.finally(() => editsPending.current--);
       queue.current = next;
     },
-    [scheduleAutosave, takeStartupWaiting],
+    [scheduleAutosave, takeStartupWaiting, setOffers],
   );
-  const discardRestore = useCallback(() => {
-    setPendingRestore(null);
-    void clearOffered();
-    setMessage({ text: "Unsaved work discarded.", error: false });
-    // Lane 37: a start-up file waiting for this answer opens now (its own message follows).
-    const waiting = takeStartupWaiting();
-    if (waiting) void openStartupRef.current(waiting);
-  }, [takeStartupWaiting]);
+  const restoreRef = useRef(restore);
+  restoreRef.current = restore;
+  const discardRestore = useCallback(
+    (a: Offer) => {
+      if (!offersRef.current.some((o) => o.id === a.id)) return;
+      const rest = offersRef.current.filter((o) => o.id !== a.id);
+      droppedRef.current = "";
+      setOffers(rest);
+      void clearOffered(a.id);
+      // Lane 64: older work set aside is offered at once; a start-up file waits for it too.
+      if (rest.length) {
+        showOffer("Unsaved work discarded. ");
+        return;
+      }
+      setMessage({ text: "Unsaved work discarded.", error: false });
+      // Lane 37: a start-up file waiting for this answer opens now (its own message follows).
+      const waiting = takeStartupWaiting();
+      if (waiting) void openStartupRef.current(waiting);
+    },
+    [takeStartupWaiting, setOffers, showOffer],
+  );
   const discardRef = useRef(discardRestore);
   discardRef.current = discardRestore;
 
@@ -766,6 +866,7 @@ export function App() {
         }
         setReport({ title: `Opened ${f.name}: an empty model`, lines: notes });
         setSelection([]);
+        afterHistoryRef.current();
         setView("iso");
         return;
       }
@@ -812,7 +913,11 @@ export function App() {
         live.current.units = du as UnitSystem;
       }
       setReport(opened.notes.length ? { title: `Opened ${f.name}`, lines: opened.notes } : null);
+      // Live first: the active tool reads the selection as soon as it is told (#76), and an
+      // id selected in the old model can name something in this one.
+      live.current.selection = [];
       setSelection([]);
+      afterHistoryRef.current();
       setFitSeq((n) => n + 1);
     },
     [run, confirmDiscard, markClean],
@@ -864,6 +969,7 @@ export function App() {
       markClean(r.scene.state.log_hash);
       setReport(null);
       setSelection([]);
+      afterHistoryRef.current();
       setView("iso");
     }
   }, [run, confirmDiscard, markClean, docName]);
@@ -1042,14 +1148,18 @@ export function App() {
         setScene(s);
         setKernelState("ready");
         setSavedLogLen(s.state.log_len);
+        emptyLogLen.current = s.state.log_len;
         let offered = false;
         if (autosaveEnabled()) {
           // Never blocks the start (lane 16): a record that cannot be read or is too large is
-          // offered for discarding only.
+          // offered for discarding only. Lane 64 (#94): every piece of work set aside is
+          // offered, newest first.
           try {
-            const saved = await takeAutosave();
-            if (worthRestoring(saved)) {
-              setPendingRestore(saved);
+            const found = await takeAutosaves();
+            if (found.offers.length) {
+              droppedRef.current = droppedNote(found.dropped);
+              setOffers(found.offers);
+              showOffer();
               offered = true;
             }
           } catch {
@@ -1066,8 +1176,11 @@ export function App() {
           /* a shell that cannot say: no start-up file */
         }
         const order = startupOrder(path, offered);
-        if (path !== null && order === "wait") setStartupWaiting(path);
-        else if (path !== null && order === "open") void openStartupRef.current(path);
+        if (path !== null && order === "wait") {
+          setStartupWaiting(path);
+          // The offer again, now saying the file waits for the answer.
+          showOffer();
+        } else if (path !== null && order === "open") void openStartupRef.current(path);
       })
       .catch((err) => {
         if (err instanceof KernelUnavailableError) {
@@ -1083,22 +1196,6 @@ export function App() {
       kernelRef.current = null;
     };
   }, []);
-
-  useEffect(() => {
-    if (!pendingRestore) return;
-    const usable = pendingRestore.state === "ok";
-    const waiting = startupWaiting ? ` ${waitingNote(startupWaiting)}` : "";
-    setMessage({
-      text: usable ? `Restore unsaved work? ${describeAutosave(pendingRestore)}.${waiting}` : `Unsaved work was kept in this browser, but ${describeAutosave(pendingRestore)}; it is set aside, not loaded.${waiting}`,
-      error: !usable,
-      actions: usable
-        ? [
-            { label: "Restore", run: () => restore(pendingRestore) },
-            { label: "Discard", run: discardRestore },
-          ]
-        : [{ label: "Discard", run: discardRestore }],
-    });
-  }, [pendingRestore, restore, discardRestore, startupWaiting]);
 
   // Read-only hooks for e2e tests: every solid with its display number, bounds and volume,
   // and the scene graph (groups, components, the open context).
@@ -1176,6 +1273,7 @@ export function App() {
         .then((n) => {
           if (stale) return;
           setNesting(n);
+          setNestScene(scene);
           setNestProblem(null);
           setNestBusy(false);
         })
@@ -1498,6 +1596,7 @@ export function App() {
   afterHistoryRef.current = () => {
     const t = activeRef.current;
     t?.reset();
+    t?.modelChanged();
     setToolView(t?.view() ?? EMPTY_VIEW);
     if (!live.current.vcbEditing) setVcb(defaultValue(toolIdRef.current, live.current.units));
   };
@@ -1712,6 +1811,34 @@ export function App() {
     return Promise.resolve();
   }, []);
 
+  /** #111: an edit made from outside the active tool that can hide what the tool worked out
+   * from the selection (the Outliner's eye, Edit > Hide, a tag, a scene, Close Group): once it has landed,
+   * and only when it hid something that was drawn or took something out of the selection, the
+   * tool is told, as after Undo and Delete (#85). Showing things, or a scene that only moves
+   * the camera, leaves a step half done alone. Not done in `apply` itself, since a tool's own
+   * steps go through it and telling the tool there would cancel them. */
+  const applyFromOutside = useCallback(
+    (op: KernelOp, describe?: (r: EditResult) => string) => {
+      // Read when the step runs, not when it is queued: an edit queued before it may still
+      // change the model.
+      let before: DocState | undefined;
+      let selected = 0;
+      return run(
+        (k) => {
+          before = live.current.scene?.state;
+          selected = live.current.selection.length;
+          return k.apply(op);
+        },
+        op,
+        describe,
+      ).then((r) => {
+        if (r && (live.current.selection.length < selected || hidSomething(before, r.scene.state))) afterHistoryRef.current();
+        return r;
+      });
+    },
+    [run],
+  );
+
   /** Delete / Backspace: erase the selection as one undo step. */
   const eraseSelection = useCallback(() => {
     const sel = live.current.selection;
@@ -1726,6 +1853,9 @@ export function App() {
       if (r) {
         live.current.selection = [];
         setSelection([]);
+        // #85: the active tool is told, as after Undo (Scale's box and grips go with the
+        // solid, and a typed factor no longer starts with an Undo of this Delete).
+        afterHistoryRef.current();
       }
     });
   }, [apply]);
@@ -1742,6 +1872,8 @@ export function App() {
         const rest = sel.filter((e) => e.kind !== "curve");
         live.current.selection = rest;
         setSelection(rest);
+        // #111: told with the curves gone from the selection, as Delete does (#85).
+        afterHistoryRef.current();
       }
     });
   }, [apply]);
@@ -1776,7 +1908,11 @@ export function App() {
       if (!items.length) return void setMessage({ text: "Select the solids, groups or components to group first.", error: true });
       if (!(await inContext(parentOfItem(items[0])))) return;
       const r = await apply({ op: "make_group", items }, () => `Grouped ${plural(items.length, "item")}. Double-click the group to edit inside it.`);
-      if (r?.outcome.kind === "group_created") select([{ kind: "node", node: r.outcome.group }]);
+      if (r?.outcome.kind === "group_created") {
+        select([{ kind: "node", node: r.outcome.group }]);
+        // #111: told with the group selected, so Scale's box is the group's, not the solid's.
+        afterHistoryRef.current();
+      }
     },
     [apply, inContext, parentOfItem, select],
   );
@@ -1799,7 +1935,11 @@ export function App() {
           void (async () => {
             if (!(await inContext(parentOfItem(items[0])))) return;
             const r = await apply({ op: "make_component", items, name }, () => `Made component ${quoted(name)}. Copies of it (Move with Ctrl) are instances: edit one, they all change.`);
-            if (r?.outcome.kind === "component_created") select([{ kind: "node", node: r.outcome.instance }]);
+            if (r?.outcome.kind === "component_created") {
+              select([{ kind: "node", node: r.outcome.instance }]);
+              // #111: told with the instance selected, as after Make Group.
+              afterHistoryRef.current();
+            }
           })(),
       });
     },
@@ -1816,6 +1956,8 @@ export function App() {
       if (r) {
         const outs = r.outcome.kind === "batch" ? r.outcome.outcomes : [r.outcome];
         select(outs.flatMap((o) => (o.kind === "exploded" ? [...o.objects.map((object) => ({ kind: "object" as const, object })), ...o.nodes.map((node) => ({ kind: "node" as const, node }))] : [])));
+        // #111: told with what was inside selected; the group the tool worked from is gone.
+        afterHistoryRef.current();
       }
     },
     [apply, inContext, parentOfItem, select],
@@ -1919,7 +2061,7 @@ export function App() {
           return;
         case "hide":
         case "show":
-          void apply({ op: "set_hidden", items, hidden: action === "hide" }, () => `${action === "hide" ? "Hid" : "Showed"} ${plural(items.length, "item")}.`);
+          void applyFromOutside({ op: "set_hidden", items, hidden: action === "hide" }, () => `${action === "hide" ? "Hid" : "Showed"} ${plural(items.length, "item")}.`);
           return;
         case "lock":
         case "unlock":
@@ -1932,13 +2074,17 @@ export function App() {
             if (!(await inContext(parentOfItem(items[0])))) return;
             const ops: KernelOp[] = items.map((it) => ("node" in it ? { op: "delete_node", node: it.node } : { op: "delete_object", object: it.object }));
             const r = await apply(ops.length === 1 ? ops[0] : { op: "batch", ops }, () => `Deleted ${plural(items.length, "item")}.`);
-            if (r) select([]);
+            if (r) {
+              select([]);
+              // #111: told with the selection already empty, as Delete does (#85).
+              afterHistoryRef.current();
+            }
           })();
           return;
         }
       }
     },
-    [apply, makeGroup, makeComponent, explode, inContext, parentOfItem, select],
+    [apply, applyFromOutside, makeGroup, makeComponent, explode, inContext, parentOfItem, select],
   );
 
   /** A row clicked in the Outliner: select it, opening what holds it when that is not open. */
@@ -2038,9 +2184,9 @@ export function App() {
       setCamView(null);
       setActiveScene(name);
       const before = live.current.scene?.state.style;
-      void apply({ op: "activate_scene", name }, () => sceneNote(name, sc, before));
+      void applyFromOutside({ op: "activate_scene", name }, () => sceneNote(name, sc, before));
     },
-    [apply],
+    [applyFromOutside],
   );
 
   const addScene = useCallback(() => {
@@ -2214,7 +2360,7 @@ export function App() {
   }, [nestOpen]);
   const setNestSettings = useCallback(
     (s: NestSettings) =>
-      void apply({ op: "set_nest_settings", settings: s }, () => `Nesting: kerf ${fineU(s.kerf, nestUnits)}, trim ${s.trim > 0 ? `${fineU(s.trim, nestUnits)} per edge` : "none"}${s.jointLoss !== undefined ? `, joint loss ${fineU(s.jointLoss, nestUnits)}` : ""}, ${s.algorithm === "guillotine" ? "table saw (straight cuts edge to edge)" : "tightest layout"}.`),
+      void apply({ op: "set_nest_settings", settings: s }, () => `Nesting: kerf ${fineU(s.kerf, nestUnits)}, trim ${s.trim > 0 ? `${fineU(s.trim, nestUnits)} per edge` : "none"}${s.jointLoss !== undefined ? `, joint loss ${fineU(s.jointLoss, nestUnits)}` : ""}${s.minStrip !== undefined ? `, minimum strip ${fineU(s.minStrip, nestUnits)}` : ""}, ${s.algorithm === "guillotine" ? "table saw (straight cuts edge to edge)" : "tightest layout"}.`),
     [apply, nestUnits],
   );
   const defineStock = useCallback(
@@ -2228,7 +2374,7 @@ export function App() {
       void apply({ op: "set_material_stock", material, stock }, () => (stock ? `${quoted(material)} parts come from ${quoted(stock)}.` : `${quoted(material)} parts: stock chosen automatically.`)),
     [apply],
   );
-  const resetStock = useCallback(() => void apply({ op: "reset_stock_library" }, () => "Stock back to the built-in sheets and boards (kerf 1/8 in, no trim, table saw)."), [apply]);
+  const resetStock = useCallback(() => void apply({ op: "reset_stock_library" }, () => `Stock back to the built-in sheets and boards: ${builtInStockText(nestUnits)}.`), [apply, nestUnits]);
   const hoverPlacement = useCallback((p: Placement | null) => setNestHover(p ? entityOfItem(p.item) : null), []);
   /** A nested piece clicked: select it in the model (as its cut list row would, one piece). */
   const selectPlacement = useCallback(
@@ -2827,13 +2973,14 @@ export function App() {
               r.outcome.kind === "paint_cleared" ? `Paint cleared from ${plural(r.outcome.cleared_faces, "face")} and ${plural(r.outcome.cleared_items, "item")}: what holds them shows now.` : "Paint cleared.",
             ),
         },
-        { label: "Hide", disabled: !selItems.length, onSelect: () => void apply({ op: "set_hidden", items: selItems, hidden: true }, () => `Hid ${plural(selItems.length, "item")} (the Outliner's eye shows them again).`) },
+        { label: "Hide", disabled: !selItems.length, onSelect: () => void applyFromOutside({ op: "set_hidden", items: selItems, hidden: true }, () => `Hid ${plural(selItems.length, "item")} (the Outliner's eye shows them again).`) },
         { label: "Lock", disabled: !selItems.length, onSelect: () => void apply({ op: "set_locked", items: selItems, locked: true }, () => `Locked ${plural(selItems.length, "item")}.`) },
         {
           label: "Close Group / Component",
           keys: "Esc",
           disabled: (st?.graph?.context ?? null) === null,
-          onSelect: () => void apply({ op: "leave_context" }, (r) => `Closed it. Editing ${contextTrail(r.scene.state.graph)}.`),
+          // #111: closing takes what was selected inside out of the selection.
+          onSelect: () => void applyFromOutside({ op: "leave_context" }, (r) => `Closed it. Editing ${contextTrail(r.scene.state.graph)}.`),
         },
         {
           label: "Delete Imported Meshes",
@@ -2845,7 +2992,15 @@ export function App() {
           },
         },
         "-",
-        { label: "Restore Unsaved Work", disabled: !pendingRestore || pendingRestore.state !== "ok", onSelect: () => pendingRestore && restore(pendingRestore) },
+        // Lane 64 (#94): the front piece of set-aside work that can be restored.
+        {
+          label: "Restore Unsaved Work",
+          disabled: !offers.some((o) => o.state === "ok"),
+          onSelect: () => {
+            const a = offersRef.current.find((o) => o.state === "ok");
+            if (a) restore(a);
+          },
+        },
         "-",
         {
           label: "Units",
@@ -2896,21 +3051,14 @@ export function App() {
       ],
       Plugins: plugins.menu,
       Tools: [{ label: "Section Plane", title: "Cut the model with a plane (no default key)", checked: toolId === "section", onSelect: () => selectTool("section") }],
-      // The browser demo's way back to the site (the desktop app has no Help entries yet).
-      ...(isWebDemo()
-        ? {
-            Help: [
-              { label: "User Guide", onSelect: () => openLink(sitePage("guide/")) },
-              { label: "What's New", onSelect: () => openLink(sitePage("changelog/")) },
-              "-" as const,
-              { label: "Download the Desktop App", title: "Windows, macOS and Linux installers on GitHub", onSelect: () => openLink(RELEASES_URL) },
-              { label: "Source on GitHub", onSelect: () => openLink(REPO_URL) },
-            ],
-          }
-        : {}),
+      // Lane 67 (#97): the way to the guide, the changelog and the source, in every build; the
+      // desktop app opens them in the system's browser (src/lib/help.ts).
+      Help: helpLinks(isTauri()).map((h) =>
+        h === "-" ? h : { label: h.label, title: h.title, onSelect: () => openLink(h.url, (text) => setMessage({ text, error: true })) },
+      ),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [st?.can_undo, st?.can_redo, st?.guides?.length, st?.meshes, st?.scenes, st?.graph, st?.style, toolId, apply, undo, redo, zoomExtents, projection, setView, selectAll, eraseSelection, selection, selItems, pendingRestore, restore, newDocument, openDialog, save, importDialog, importUnits, exportAs, exportSection, sectionAction, makeGroup, makeComponent, explode, explodeCurves, addScene, goScene, activeScene, plugins.menu, mode, setMode, scene?.sheets, exportSheets, setGrid, units, chooseUnits, closeShell, setMessage],
+    [st?.can_undo, st?.can_redo, st?.guides?.length, st?.meshes, st?.scenes, st?.graph, st?.style, toolId, apply, applyFromOutside, undo, redo, zoomExtents, projection, setView, selectAll, eraseSelection, selection, selItems, offers, restore, newDocument, openDialog, save, importDialog, importUnits, exportAs, exportSection, sectionAction, makeGroup, makeComponent, explode, explodeCurves, addScene, goScene, activeScene, plugins.menu, mode, setMode, scene?.sheets, exportSheets, setGrid, units, chooseUnits, closeShell, setMessage],
   );
 
   const valueLabel = active?.valueLabel() ?? null;
@@ -3087,6 +3235,9 @@ export function App() {
           onLabels: () => void saveCut((l) => labelsPdf(l, cutTitle), "labels.pdf", PDF_TYPE, `${plural(cutList?.rows.length ?? 0, "label")} on Avery 5160-size sheets`),
           nestOpen,
           onNest: toggleNest,
+          // #56: the glue-up notes only from a nesting of the model as it is now and of the
+          // same parts as the list.
+          nested: nestShown && !nestProblem && nestScene === scene && nesting?.visible_only === cutList?.visible_only ? nesting : null,
           nesting: nestShown ? (
             <NestingSection
               nesting={nesting}
@@ -3094,6 +3245,7 @@ export function App() {
               busy={nestBusy}
               rounding={nestUnits}
               units={units}
+              stored={scene?.state.nest_settings ?? null}
               onSettings={setNestSettings}
               onStock={() => setStockOpen(true)}
               onHover={hoverPlacement}
@@ -3154,7 +3306,7 @@ export function App() {
           state: st ?? null,
           canTag: selItems.length > 0,
           onCreate: () => void createTag(),
-          onVisible: (tag, visible) => void apply({ op: "set_tag_visible", tag, visible }, () => `Tag ${quoted(tag)} ${visible ? "shown" : "hidden"}.`),
+          onVisible: (tag, visible) => void applyFromOutside({ op: "set_tag_visible", tag, visible }, () => `Tag ${quoted(tag)} ${visible ? "shown" : "hidden"}.`),
           onColor: (tag, color) => void apply({ op: "set_tag_color", tag, color: hexToRgb(color) }),
           onRename: (tag, name) => {
             const created = createdTagRef.current === tag;
@@ -3164,7 +3316,8 @@ export function App() {
           onDelete: (tag) => void apply({ op: "delete_tag", tag }, () => `Tag ${quoted(tag)} deleted: what was on it is untagged now.`),
           onAssign: (tag) => {
             const items = itemsOf(live.current.selection);
-            void apply({ op: "tag_items", items, tag }, () => `${plural(items.length, "item")} on ${tag ? `tag ${quoted(tag)}` : "Untagged"}.`);
+            // #111: a hidden tag hides what is put on it.
+            void applyFromOutside({ op: "tag_items", items, tag }, () => `${plural(items.length, "item")} on ${tag ? `tag ${quoted(tag)}` : "Untagged"}.`);
           },
           editing: editingTag,
           onEdited: () => {
@@ -3194,6 +3347,7 @@ export function App() {
         units={units}
         onUnits={chooseUnits}
         message={message}
+        setAside={offers.length && !message?.offer ? { count: offers.length, onShow: () => showOffer() } : null}
         empty={kernelState === "ready" && !!st && st.stats.objects === 0 && st.stats.edges === 0 && !st.meshes?.length}
         firstRunHint={isWebDemo()}
         openPicker={unitPickerOpen}
@@ -3202,7 +3356,3 @@ export function App() {
   );
 }
 
-/** Open a page of the site or GitHub in a new tab (browser demo only). */
-function openLink(url: string) {
-  window.open(url, "_blank", "noopener,noreferrer");
-}

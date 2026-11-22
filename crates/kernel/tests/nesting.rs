@@ -13,7 +13,9 @@ use sawhorse_kernel::cutlist::{
     Rounding,
 };
 use sawhorse_kernel::model::{DrawTarget, Op, OpOutcome};
-use sawhorse_kernel::nesting::{CutDir, NestOptions, Nesting, UnplacedReason, nest_list};
+use sawhorse_kernel::nesting::{
+    CutDir, NestOptions, Nesting, StockPiece, UnplacedReason, nest_list, up_to_stock,
+};
 use sawhorse_kernel::nodes::Item;
 use sawhorse_kernel::stock::{
     NestAlgorithm, NestSettings, StockDef, StockGrain, StockKind, StockLibrary,
@@ -848,17 +850,43 @@ fn settings() -> impl Strategy<Value = NestSettings> {
         1 => Just(0.0),
         1 => 0.0..(0.5 * IN)
     ];
-    (kerf, trim, alg, joint).prop_map(|(kerf, trim, algorithm, joint_loss)| NestSettings {
-        kerf,
-        trim,
-        algorithm,
-        joint_loss,
-    })
+    // #57: mostly the #56 rule; else none, half a board's width or more, or any in range.
+    let min_strip = prop_oneof![
+        3 => Just(None),
+        1 => Just(Some(0.0)),
+        1 => Just(Some(12.0 * IN)),
+        1 => (0.0..(12.0 * IN)).prop_map(Some)
+    ];
+    (kerf, trim, alg, joint, min_strip).prop_map(
+        |(kerf, trim, algorithm, joint_loss, min_strip)| NestSettings {
+            kerf,
+            trim,
+            algorithm,
+            joint_loss,
+            min_strip,
+        },
+    )
 }
 
 fn library() -> impl Strategy<Value = StockLibrary> {
-    (any::<bool>(), any::<bool>()).prop_map(|(grainless, small)| {
+    (any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(grainless, small, long)| {
         let mut l = StockLibrary::builtin();
+        // #56: longer, narrower boards beside the built-in 96 in ones, so a part too long for
+        // the board the rest shares can go to one long enough (the verifier's case).
+        if long {
+            let boards: Vec<StockDef> = l
+                .stocks
+                .iter()
+                .filter(|s| s.kind == StockKind::Board)
+                .cloned()
+                .collect();
+            for mut s in boards {
+                s.name = format!("{} long", s.name);
+                s.length = 120.0 * IN;
+                s.width *= 0.5;
+                l.stocks.push(s);
+            }
+        }
         if grainless {
             for s in &mut l.stocks {
                 s.grain = StockGrain::None;
@@ -896,6 +924,7 @@ fn oak(parts: &[(f64, f64, f64, usize)], joint_loss: f64) -> Nesting {
         trim: 0.0,
         algorithm: NestAlgorithm::Guillotine,
         joint_loss: joint_loss * IN,
+        min_strip: None,
     };
     let n = nest_list(&list, &lib, st);
     check_nesting_of(&list, &n).unwrap();
@@ -924,8 +953,10 @@ fn near_in(a: f64, b: f64) -> bool {
 
 /// #49: a solid part wider than every board is glued up from full-width strips and one
 /// filler instead of being reported too large. A 15 x 40 in panel is wider than the widest
-/// built-in 4/4 board (12 in): one 12 in strip and a 3 1/8 in filler (15 + 1/8 joint loss
-/// - 12), on one board, tagged 1.1 and 1.2.
+/// built-in 4/4 board (12 in). #56: 4/4 x 8 and 4/4 x 12 both glue it from two strips, and
+/// with nothing else of that oak library order decides, 4/4 x 8: one 8 in strip and a
+/// 7 1/8 in filler (15 + 1/8 joint loss - 8), on one board, tagged 1.1 and 1.2 (#53 took
+/// the widest board, 12 + 3 1/8 in).
 #[test]
 fn a_part_wider_than_every_board_is_glued_up() {
     let n = oak(&[(0.75, 15.0, 40.0, 1)], 0.125);
@@ -934,8 +965,8 @@ fn a_part_wider_than_every_board_is_glued_up() {
     assert_eq!(n.totals.boards, 1);
     let s = strips_of(&n, 0);
     assert_eq!(s.len(), 2);
-    assert!(s.iter().all(|(stock, _)| stock == "4/4 x 12 x 96"));
-    assert!(near_in(s[0].1, 12.0) && near_in(s[1].1, 3.125), "{s:?}");
+    assert!(s.iter().all(|(stock, _)| stock == "4/4 x 8 x 96"));
+    assert!(near_in(s[0].1, 8.0) && near_in(s[1].1, 7.125), "{s:?}");
     let tags: Vec<&str> = n.pieces[0]
         .placements
         .iter()
@@ -950,24 +981,22 @@ fn a_part_wider_than_every_board_is_glued_up() {
     );
     assert_eq!(n.glue_ups.len(), 1);
     assert_eq!(n.glue_ups[0].tag, "1");
-    assert_eq!(n.glue_ups[0].stock, "4/4 x 12 x 96");
+    assert_eq!(n.glue_ups[0].stock, "4/4 x 8 x 96");
 }
 
-/// #49's example: a 17 in cabinet side from 6 in stock is three strips, two full width and
-/// a filler (17 + 2 x 1/8 - 12 = 5 1/4 in). The strips come off the board the rest of the
-/// oak uses (two 5 in shelves put it on 4/4 x 6). A part a listed board makes in one piece
-/// is never glued: a 10 in part fits 4/4 x 12, so it is one piece.
+/// #49's example: a 17 in cabinet side beside two 5 in shelves, which put the rest of the
+/// oak on 4/4 x 6. #56: it is glued from the board that takes the fewest strips, 4/4 x 12:
+/// a 12 in strip and a 5 1/8 in filler (17 + 1/8 - 12), one joint, where the shelves' 6 in
+/// board took three strips, two joints (#53 glued it 6 + 6 + 5 1/4 in). A part a listed
+/// board makes in one piece is never glued: a 10 in part fits 4/4 x 12, so it is one piece.
 #[test]
-fn a_side_glued_from_the_boards_the_rest_of_the_oak_uses() {
+fn a_side_glued_from_the_board_that_takes_the_fewest_strips() {
     let n = oak(&[(0.75, 5.0, 30.0, 2), (0.75, 17.0, 30.0, 1)], 0.125);
     assert_eq!(n.totals.unplaced, 0, "{:#?}", n.unplaced);
     let s = strips_of(&n, 1);
-    assert_eq!(s.len(), 3, "{s:?}");
-    assert!(s.iter().all(|(stock, _)| stock == "4/4 x 6 x 96"), "{s:?}");
-    assert!(
-        near_in(s[0].1, 6.0) && near_in(s[1].1, 6.0) && near_in(s[2].1, 5.25),
-        "{s:?}"
-    );
+    assert_eq!(s.len(), 2, "{s:?}");
+    assert!(s.iter().all(|(stock, _)| stock == "4/4 x 12 x 96"), "{s:?}");
+    assert!(near_in(s[0].1, 12.0) && near_in(s[1].1, 5.125), "{s:?}");
     // The shelves are whole pieces.
     assert!(
         n.pieces
@@ -1031,21 +1060,61 @@ fn no_joint_loss_glues_whole_boards() {
     assert!(near_in(s[0].1, 12.0) && near_in(s[1].1, 12.0), "{s:?}");
 }
 
-/// Lane 42: a glue-up never plans a filler narrower than the kerf. With no joint loss and a
-/// 1/8 in kerf, a 12 1/16 in panel would be a 12 in strip and a 1/16 in sliver, so it is
-/// reported too large with its board, as before #49; with a 1/16 in joint loss its filler
-/// is 1/8 in, the kerf itself, and it is glued.
+/// Lane 42: a glue-up never plans a strip narrower than the kerf. #56: nor a last strip
+/// under the minimum, the smaller of 1 1/2 in and a quarter of the board: it and the strip
+/// before it are made equal. With no joint loss and a 1/8 in kerf, a 6 1/16 in panel on
+/// 6 in boards would be a 6 in strip and a 1/16 in sliver, reported too large (#53); now it
+/// is 3 1/32 + 3 1/32 in. With a 1/16 in joint loss it was 6 + 1/8 in; now
+/// 3 1/16 + 3 1/16 in. #53's 12 1/16 in oak panel, refused then, is now one joint on
+/// 4/4 x 8 (8 + 4 1/16 in), the first of the boards that glue it from two strips.
 #[test]
-fn a_filler_narrower_than_the_kerf_is_never_planned() {
+fn a_filler_under_the_minimum_is_made_equal_with_the_strip_before_it() {
+    for (joint, each) in [(0.0, 3.03125), (0.0625, 3.0625)] {
+        let (list, n) =
+            on_six_inch_boards([0.75 * IN, 6.0625 * IN, 40.0 * IN], joint * IN, IN / 8.0);
+        check_nesting_of(&list, &n).unwrap();
+        assert!(n.unplaced.is_empty(), "{:#?}", n.unplaced);
+        let s = strips_of(&n, 0);
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert!(near_in(s[0].1, each) && near_in(s[1].1, each), "{s:?}");
+    }
     let n = oak(&[(0.75, 12.0625, 40.0, 1)], 0.0);
-    assert!(n.glue_ups.is_empty(), "{:#?}", n.glue_ups);
-    assert_eq!(n.unplaced.len(), 1, "{:#?}", n.unplaced);
-    assert_eq!(n.unplaced[0].reason, UnplacedReason::TooLarge);
-    assert_eq!(n.unplaced[0].stock.as_deref(), Some("4/4 x 12 x 96"));
-    let n = oak(&[(0.75, 12.0625, 40.0, 1)], 0.0625);
+    let s = strips_of(&n, 0);
+    assert!(s.iter().all(|(stock, _)| stock == "4/4 x 8 x 96"), "{s:?}");
+    assert!(near_in(s[0].1, 8.0) && near_in(s[1].1, 4.0625), "{s:?}");
+    // #56's example: a 6.003 in part on 6 in boards, with a 1/8 in joint loss, would be
+    // 6 + 0.128 in; the minimum on a 6 in board is 1 1/2 in, so it is 3.064 + 3.064 in.
+    let (list, n) = on_six_inch_boards([0.75 * IN, 6.003 * IN, 20.0 * IN], IN / 8.0, IN / 8.0);
+    check_nesting_of(&list, &n).unwrap();
     let s = strips_of(&n, 0);
     assert_eq!(s.len(), 2, "{s:?}");
-    assert!(near_in(s[0].1, 12.0) && near_in(s[1].1, 0.125), "{s:?}");
+    assert!(near_in(s[0].1, 3.064) && near_in(s[1].1, 3.064), "{s:?}");
+    // A filler at the minimum or wider stays: 7 1/2 in on 6 in boards with no joint loss is
+    // 6 + 1 1/2 in.
+    let (list, n) = on_six_inch_boards([0.75 * IN, 7.5 * IN, 20.0 * IN], 0.0, IN / 8.0);
+    check_nesting_of(&list, &n).unwrap();
+    let s = strips_of(&n, 0);
+    assert!(near_in(s[0].1, 6.0) && near_in(s[1].1, 1.5), "{s:?}");
+    // A quarter of the board when that is less: on 4 in boards the minimum is 1 in, so
+    // 5.1 in is 4 + 1.1 in, and 4.9 in is 4 + 0.9 in made equal, 2.45 + 2.45 in.
+    let on_four = |w: f64| {
+        let list = list_of(&[(0.75, w, 30.0, 1, Grain::Length, false, 0)], 0);
+        let mut lib = StockLibrary::builtin();
+        lib.defaults.clear();
+        lib.stocks
+            .retain(|s| s.kind == StockKind::Sheet || s.name == "4/4 x 4 x 96");
+        let st = NestSettings {
+            joint_loss: 0.0,
+            ..NestSettings::default()
+        };
+        let n = nest_list(&list, &lib, st);
+        check_nesting_of(&list, &n).unwrap();
+        strips_of(&n, 0)
+    };
+    let s = on_four(5.1);
+    assert!(near_in(s[0].1, 4.0) && near_in(s[1].1, 1.1), "{s:?}");
+    let s = on_four(4.9);
+    assert!(near_in(s[0].1, 2.45) && near_in(s[1].1, 2.45), "{s:?}");
 }
 
 /// Lane 42: a glue-up has a bounded number of strips. A 1/2 in board with a 0.49 in joint
@@ -1101,9 +1170,17 @@ fn a_glue_up_has_a_bounded_number_of_strips() {
     assert!(s.iter().all(|(_, w)| near_in(*w, 1.0)));
     assert!(too_large(&nest_on(1.0, 120.0, (100.5, 110.0), 0.0)));
     // 4 m boards (the library takes up to 10 m): 8 m and 2 nm is two whole boards and a
-    // 2 nm filler, refused; never one strip 2 nm wider than its board.
+    // 2 nm filler; never one strip 2 nm wider than its board. #56: the filler and the board
+    // before it are made two equal strips, 2 m and 1 nm each (#53 refused it).
     let n = nest_on(4.0 / IN, 10.0 / IN, ((8.0 + 2e-9) / IN, 9.0 / IN), 0.0);
-    assert!(too_large(&n), "{:#?}", n.glue_ups);
+    let s = strips_of(&n, 0);
+    assert_eq!(s.len(), 3, "{s:?}");
+    assert!(
+        (s[0].1 * IN - 4.0).abs() < 1e-12
+            && (s[1].1 * IN - (2.0 + 1e-9)).abs() < 1e-12
+            && (s[2].1 * IN - (2.0 + 1e-9)).abs() < 1e-12,
+        "{s:?}"
+    );
 }
 
 /// One part of the size given (metres, as the cut list row holds it: thickness, width,
@@ -1128,6 +1205,7 @@ fn on_six_inch_boards(size: [f64; 3], joint: f64, kerf: f64) -> (CutList, Nestin
         trim: 0.0,
         algorithm: NestAlgorithm::Guillotine,
         joint_loss: joint,
+        min_strip: None,
     };
     let n = nest_list(&list, &lib, st);
     (list, n)
@@ -1137,21 +1215,26 @@ fn on_six_inch_boards(size: [f64; 3], joint: f64, kerf: f64) -> (CutList, Nestin
 /// quotient and the filler from a sum, and the two can round apart: a part 12 in and 1 nm
 /// wide on 6 in boards with no joint loss was counted as 2 strips with a filler a hair wider
 /// than 6 in and 1 nm, which the board layout refused, a panic ("only fitting parts are laid
-/// out"). The count is now settled on the filler, so that part is reported too large, as
-/// before #49 (its third strip would be a 1 nm filler, narrower than the kerf). Every width
-/// a hundred floating point steps either side of each such boundary, for several strip
-/// counts, joint losses and kerfs, nests without a panic, keeps every invariant, and never
-/// puts a strip wider than its board.
+/// out"). The count is settled on the filler, so that part is three strips; #56 makes its
+/// 1 nm filler and the board before it two equal strips, 6 + 3 + 3 in and a hair (#53
+/// reported it too large). Every width a hundred floating point steps either side of each
+/// such boundary, for several strip counts, joint losses and kerfs, nests without a panic,
+/// keeps every invariant, never puts a strip wider than its board, and never one narrower
+/// than the minimum.
 #[test]
 fn a_part_a_hair_wider_than_whole_boards_never_panics() {
     let (list, n) = on_six_inch_boards([0.75 * IN, 0.304_800_001, 20.0 * IN], 0.0, IN / 8.0);
     check_nesting_of(&list, &n).unwrap();
-    assert!(n.glue_ups.is_empty(), "{:#?}", n.glue_ups);
-    assert_eq!(n.unplaced.len(), 1, "{:#?}", n.unplaced);
-    assert_eq!(n.unplaced[0].reason, UnplacedReason::TooLarge);
-    assert_eq!(n.unplaced[0].stock.as_deref(), Some("Six"));
+    assert!(n.unplaced.is_empty(), "{:#?}", n.unplaced);
+    let s = strips_of(&n, 0);
+    assert_eq!(s.len(), 3, "{s:?}");
+    assert!(
+        near_in(s[0].1, 6.0) && (s[1].1 - 3.0).abs() < 1e-6 && s[1].1 == s[2].1,
+        "{s:?}"
+    );
     let h = 6.0 * IN;
-    let (mut glued, mut too_large) = (0, 0);
+    let min = sawhorse_kernel::nesting::glue_minimum(h, None);
+    let (mut glued, mut made_equal) = (0, 0);
     for joint in [0.0, IN / 16.0, IN / 8.0, IN / 2.0] {
         for kerf in [0.0, IN / 8.0] {
             for strips in [2usize, 3, 5, 40] {
@@ -1165,18 +1248,29 @@ fn a_part_a_hair_wider_than_whole_boards_never_panics() {
                         .unwrap_or_else(|e| panic!("{w} m, joint {joint}, kerf {kerf}: {e}"));
                     for q in n.pieces.iter().flat_map(|p| &p.placements) {
                         assert!(q.dy <= h + 1e-9, "{w} m: a strip {} m wide", q.dy);
+                        assert!(q.dy >= min - 1e-9, "{w} m: a strip {} m wide", q.dy);
                     }
+                    assert!(n.unplaced.is_empty(), "{w} m: {:#?}", n.unplaced);
                     glued += n.glue_ups.len();
-                    too_large += n.unplaced.len();
+                    made_equal += n
+                        .glue_ups
+                        .iter()
+                        .filter(|g| {
+                            g.widths[g.widths.len() - 1] < h - 1e-9 && {
+                                let k = g.widths.len();
+                                g.widths[k - 1] == g.widths[k - 2]
+                            }
+                        })
+                        .count();
                 }
             }
         }
     }
-    // Below each edge the part is glued; just past it, with no joint loss, the filler
-    // would be a hair and the part is too large.
+    // Below each edge the filler is a whole board or nearly; just past it, it would be a
+    // hair and is made equal with the board before it.
     assert!(
-        glued > 0 && too_large > 0,
-        "{glued} glued, {too_large} too large"
+        glued > 0 && made_equal > 0,
+        "{glued} glued, {made_equal} made equal"
     );
 }
 
@@ -1250,6 +1344,261 @@ fn parts_of_no_size_end_their_cut_sequence() {
         }
     }
 }
+/// #56: ties. A 13 in part on 4/4 is two strips on 4/4 x 8 (8 + 5 1/8) and on 4/4 x 12
+/// (12 + 1 1/8, made 6 9/16 + 6 9/16), so the board the rest of the oak uses decides: 9 in
+/// parts put it on 4/4 x 12. With nothing else of that oak, or the rest on 4/4 x 4 (which
+/// takes four strips), library order decides: 4/4 x 8 comes before 4/4 x 12.
+#[test]
+fn a_tie_goes_to_the_board_the_rest_uses_then_to_library_order() {
+    let stock = |n: &Nesting, row: usize| {
+        let s = strips_of(n, row);
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert!(s.iter().all(|(st, _)| *st == s[0].0), "{s:?}");
+        s
+    };
+    let n = oak(&[(0.75, 9.0, 30.0, 1), (0.75, 13.0, 30.0, 1)], 0.125);
+    let s = stock(&n, 1);
+    assert_eq!(s[0].0, "4/4 x 12 x 96");
+    assert!(near_in(s[0].1, 6.5625) && near_in(s[1].1, 6.5625), "{s:?}");
+    let n = oak(&[(0.75, 13.0, 30.0, 1)], 0.125);
+    let s = stock(&n, 0);
+    assert_eq!(s[0].0, "4/4 x 8 x 96");
+    assert!(near_in(s[0].1, 8.0) && near_in(s[1].1, 5.125), "{s:?}");
+    let n = oak(&[(0.75, 3.0, 30.0, 2), (0.75, 13.0, 30.0, 1)], 0.125);
+    assert_eq!(stock(&n, 1)[0].0, "4/4 x 8 x 96");
+}
+
+/// #56's example: with 4/4 x 12 x 96 and 4/4 x 6 x 120 in the library, a 15 x 100 in top
+/// is too long for the wider board, and #53 reported it too large for it; the longer,
+/// narrower board glues it, 6 + 6 + 3 1/4 in. Too large only when no board of its
+/// thickness long enough can glue it: at 130 in it is.
+#[test]
+fn a_board_too_short_for_the_part_is_passed_over_for_one_long_enough() {
+    let nest = |len: f64| {
+        let list = list_of(&[(0.75, 15.0, len, 1, Grain::Length, false, 0)], 0);
+        let mut lib = StockLibrary::builtin();
+        lib.defaults.clear();
+        lib.stocks.retain(|s| s.kind == StockKind::Sheet);
+        for (w, l) in [(12.0, 96.0), (6.0, 120.0)] {
+            lib.stocks.push(StockDef {
+                name: format!("4/4 x {w} x {l}"),
+                kind: StockKind::Board,
+                length: l * IN,
+                width: w * IN,
+                thickness: 0.75 * IN,
+                nominal: None,
+                grain: StockGrain::Length,
+            });
+        }
+        let st = NestSettings {
+            kerf: IN / 8.0,
+            trim: 0.0,
+            algorithm: NestAlgorithm::Guillotine,
+            joint_loss: IN / 8.0,
+            min_strip: None,
+        };
+        let n = nest_list(&list, &lib, st);
+        check_nesting_of(&list, &n).unwrap();
+        n
+    };
+    let n = nest(100.0);
+    assert!(n.unplaced.is_empty(), "{:#?}", n.unplaced);
+    let s = strips_of(&n, 0);
+    assert_eq!(s.len(), 3, "{s:?}");
+    assert!(s.iter().all(|(st, _)| st == "4/4 x 6 x 120"), "{s:?}");
+    assert!(
+        near_in(s[0].1, 6.0) && near_in(s[1].1, 6.0) && near_in(s[2].1, 3.25),
+        "{s:?}"
+    );
+    let n = nest(130.0);
+    assert!(n.glue_ups.is_empty(), "{:#?}", n.glue_ups);
+    assert_eq!(n.unplaced.len(), 1);
+    assert_eq!(n.unplaced[0].reason, UnplacedReason::TooLarge);
+}
+
+/// #56: a part no wider than the widest board but longer than it goes to a board long
+/// enough too: glued from it when no board makes it whole, or whole on it when one does.
+/// The independent verifier found the 10 x 100 in part reported too large. A part no
+/// board holds or glues keeps the board the rest uses, as before.
+#[test]
+fn a_part_too_long_for_the_shared_board_goes_to_one_long_enough() {
+    let nest = |parts: &[(f64, f64)]| {
+        let rows: Vec<_> = parts
+            .iter()
+            .map(|&(w, l)| (0.75, w, l, 1, Grain::Length, false, 0))
+            .collect();
+        let list = list_of(&rows, 0);
+        let mut lib = StockLibrary::builtin();
+        lib.defaults.clear();
+        lib.stocks.retain(|s| s.kind == StockKind::Sheet);
+        for (w, l) in [(12.0, 96.0), (6.0, 120.0)] {
+            lib.stocks.push(StockDef {
+                name: format!("4/4 x {w} x {l}"),
+                kind: StockKind::Board,
+                length: l * IN,
+                width: w * IN,
+                thickness: 0.75 * IN,
+                nominal: None,
+                grain: StockGrain::Length,
+            });
+        }
+        let st = NestSettings {
+            kerf: IN / 8.0,
+            trim: 0.0,
+            algorithm: NestAlgorithm::Guillotine,
+            joint_loss: IN / 8.0,
+            min_strip: None,
+        };
+        let n = nest_list(&list, &lib, st);
+        check_nesting_of(&list, &n).unwrap();
+        n
+    };
+    // Glued: 6 + 4 1/8 in from the longer board, alone and beside a 15 x 100 in part.
+    for parts in [&[(10.0, 100.0)][..], &[(10.0, 100.0), (15.0, 100.0)][..]] {
+        let n = nest(parts);
+        assert!(n.unplaced.is_empty(), "{:#?}", n.unplaced);
+        let s = strips_of(&n, 0);
+        assert!(s.iter().all(|(st, _)| st == "4/4 x 6 x 120"), "{s:?}");
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert!(near_in(s[0].1, 6.0) && near_in(s[1].1, 4.125), "{s:?}");
+    }
+    // Whole: a 5 x 100 in part beside a 10 x 50 in one fits the longer board in one piece.
+    let n = nest(&[(5.0, 100.0), (10.0, 50.0)]);
+    assert!(n.unplaced.is_empty(), "{:#?}", n.unplaced);
+    assert!(n.glue_ups.is_empty(), "{:#?}", n.glue_ups);
+    // Neither: 10 x 130 in is too large, reported on the board the rest would share.
+    let n = nest(&[(10.0, 130.0)]);
+    assert!(n.glue_ups.is_empty(), "{:#?}", n.glue_ups);
+    assert_eq!(n.unplaced.len(), 1);
+    assert_eq!(n.unplaced[0].reason, UnplacedReason::TooLarge);
+    assert_eq!(n.unplaced[0].stock.as_deref(), Some("4/4 x 12 x 96"));
+}
+
+/// Lane 45 (the review of #62): a part narrow enough for the board the rest of its wood
+/// shares but longer than every board of its thickness goes in one piece on a thicker board
+/// long enough, as a part wider than every board does since #49; #53 reported it too large.
+/// A 3/4 x 3 x 100 in rail beside a 5 in shelf, with 4/4 x 6 x 96 and 5/4 x 6 x 120: the
+/// rail is whole on 5/4 x 6 x 120, the shelf stays on 4/4 x 6 x 96. Without the 5/4 board
+/// the rail is too large on 4/4 x 6 x 96, as before.
+#[test]
+fn a_part_too_long_for_its_thickness_goes_whole_on_a_thicker_board_long_enough() {
+    let nest = |thicker: bool| {
+        let rows = [
+            (0.75, 3.0, 100.0, 1, Grain::Length, false, 0),
+            (0.75, 5.0, 30.0, 1, Grain::Length, false, 0),
+        ];
+        let list = list_of(&rows, 0);
+        let mut lib = StockLibrary::builtin();
+        lib.defaults.clear();
+        lib.stocks
+            .retain(|s| s.kind == StockKind::Sheet || s.name == "4/4 x 6 x 96");
+        if thicker {
+            lib.stocks.push(StockDef {
+                name: "5/4 x 6 x 120".into(),
+                kind: StockKind::Board,
+                length: 120.0 * IN,
+                width: 6.0 * IN,
+                thickness: 1.0625 * IN,
+                nominal: Some("5/4".into()),
+                grain: StockGrain::Length,
+            });
+        }
+        let n = nest_list(&list, &lib, NestSettings::default());
+        check_nesting_of(&list, &n).unwrap();
+        n
+    };
+    let stock_of = |n: &Nesting, row: usize| {
+        n.pieces
+            .iter()
+            .find(|p| p.placements.iter().any(|q| q.row == row))
+            .map(|p| p.stock.clone())
+    };
+    let n = nest(true);
+    assert!(n.unplaced.is_empty(), "{:#?}", n.unplaced);
+    assert!(n.glue_ups.is_empty(), "{:#?}", n.glue_ups);
+    assert_eq!(stock_of(&n, 0).as_deref(), Some("5/4 x 6 x 120"));
+    assert_eq!(stock_of(&n, 1).as_deref(), Some("4/4 x 6 x 96"));
+    let n = nest(false);
+    assert_eq!(n.unplaced.len(), 1, "{:#?}", n.unplaced);
+    assert_eq!(n.unplaced[0].row, 0);
+    assert_eq!(n.unplaced[0].reason, UnplacedReason::TooLarge);
+    assert_eq!(n.unplaced[0].stock.as_deref(), Some("4/4 x 6 x 96"));
+}
+
+/// Lane 45 (the review of #62): a part whose stock is said keeps that board even when
+/// another board of its thickness glues it from fewer strips. A 17 x 30 in oak side with
+/// oak's default stock 4/4 x 6 x 96, or with 4/4 x 6 x 96 named by the part, is three
+/// strips of it, 6 + 6 + 5 1/4 in, though 4/4 x 12 would take two.
+#[test]
+fn a_part_whose_stock_is_said_keeps_it_over_fewer_strips() {
+    for named in [false, true] {
+        let mut list = list_of(&[(0.75, 17.0, 30.0, 1, Grain::Length, false, 0)], 0);
+        let mut lib = StockLibrary::builtin();
+        lib.defaults.clear();
+        if named {
+            list.rows[0].stock_set = true;
+            list.rows[0].material = Some("4/4 x 6 x 96".into());
+        } else {
+            lib.defaults.insert("Oak".into(), "4/4 x 6 x 96".into());
+        }
+        let n = nest_list(&list, &lib, NestSettings::default());
+        check_nesting_of(&list, &n).unwrap();
+        let s = strips_of(&n, 0);
+        assert_eq!(s.len(), 3, "named {named}: {s:?}");
+        assert!(
+            s.iter().all(|(st, _)| st == "4/4 x 6 x 96"),
+            "named {named}: {s:?}"
+        );
+        assert!(
+            near_in(s[0].1, 6.0) && near_in(s[1].1, 6.0) && near_in(s[2].1, 5.25),
+            "named {named}: {s:?}"
+        );
+    }
+}
+
+/// Lane 45 (the review of #62): lane 42's refusal of a strip narrower than the kerf still
+/// holds after the last two strips are made equal, on the narrowest of them. A 0.8 x 20 in
+/// part on 3/4 in wide strip stock with no joint loss would leave a 0.05 in filler, so its
+/// two strips are 0.4 + 0.4 in: glued with a 3/8 in kerf, too large with a 1/2 in kerf.
+#[test]
+fn equal_strips_narrower_than_the_kerf_are_refused() {
+    let nest = |kerf: f64| {
+        let list = list_of(&[(0.75, 0.8, 20.0, 1, Grain::Length, false, 0)], 0);
+        let mut lib = StockLibrary::builtin();
+        lib.defaults.clear();
+        lib.stocks.retain(|s| s.kind == StockKind::Sheet);
+        lib.stocks.push(StockDef {
+            name: "Strip stock".into(),
+            kind: StockKind::Board,
+            length: 96.0 * IN,
+            width: 0.75 * IN,
+            thickness: 0.75 * IN,
+            nominal: None,
+            grain: StockGrain::Length,
+        });
+        let st = NestSettings {
+            kerf: kerf * IN,
+            trim: 0.0,
+            algorithm: NestAlgorithm::Guillotine,
+            joint_loss: 0.0,
+            min_strip: None,
+        };
+        let n = nest_list(&list, &lib, st);
+        check_nesting_of(&list, &n).unwrap();
+        n
+    };
+    let n = nest(0.375);
+    assert!(n.unplaced.is_empty(), "{:#?}", n.unplaced);
+    let s = strips_of(&n, 0);
+    assert_eq!(s.len(), 2, "{s:?}");
+    assert!(near_in(s[0].1, 0.4) && near_in(s[1].1, 0.4), "{s:?}");
+    let n = nest(0.5);
+    assert!(n.glue_ups.is_empty(), "{:#?}", n.glue_ups);
+    assert_eq!(n.unplaced.len(), 1, "{:#?}", n.unplaced);
+    assert_eq!(n.unplaced[0].reason, UnplacedReason::TooLarge);
+    assert_eq!(n.unplaced[0].stock.as_deref(), Some("Strip stock"));
+}
+
 /// A part longer than every board is still too large: gluing only adds width.
 #[test]
 fn a_part_too_long_to_glue_is_still_too_large() {
@@ -1302,6 +1651,302 @@ fn the_joint_loss_is_saved_and_hashed_only_when_set() {
     assert_eq!(d.hash(), before);
     ok(&mut d, Op::SetNestSettings { settings: set });
     assert_ne!(d.hash(), before);
+}
+
+/// #57: the minimum strip is a document setting: absent (the #56 rule) unless set, 0 to
+/// 12 in, saved and hashed only when set, so every document saved before it keeps its file
+/// and its hash.
+#[test]
+fn the_minimum_strip_is_saved_and_hashed_only_when_set() {
+    let st = NestSettings::default();
+    assert_eq!(st.min_strip, None);
+    let json = serde_json::to_value(st).unwrap();
+    assert!(json.get("minStrip").is_none(), "{json}");
+    let set = NestSettings {
+        min_strip: Some(2.0 * IN),
+        ..st
+    };
+    assert_eq!(serde_json::to_value(set).unwrap()["minStrip"], 2.0 * IN);
+    let back: NestSettings = serde_json::from_value(serde_json::to_value(set).unwrap()).unwrap();
+    assert_eq!(back, set);
+    let old: NestSettings =
+        serde_json::from_value(serde_json::json!({ "kerf": IN / 8.0 })).unwrap();
+    assert_eq!(old, st);
+    for bad in [-1e-6, 12.0 * IN + 1e-6, f64::NAN, f64::INFINITY] {
+        assert!(
+            NestSettings {
+                min_strip: Some(bad),
+                ..st
+            }
+            .check()
+            .is_err(),
+            "{bad}"
+        );
+    }
+    for good in [0.0, 12.0 * IN] {
+        assert!(
+            NestSettings {
+                min_strip: Some(good),
+                ..st
+            }
+            .check()
+            .is_ok(),
+            "{good}"
+        );
+    }
+    // A model hashes as before until the setting is set, and as before again once cleared.
+    let (mut d, _) = bookshelf();
+    let before = d.hash();
+    ok(&mut d, Op::SetNestSettings { settings: st });
+    assert_eq!(d.hash(), before);
+    // The value is in the hash, not only that the library was edited: 3 in hashes apart
+    // from 2 in.
+    ok(
+        &mut d,
+        Op::SetNestSettings {
+            settings: NestSettings {
+                min_strip: Some(3.0 * IN),
+                ..st
+            },
+        },
+    );
+    let three = d.hash();
+    ok(&mut d, Op::SetNestSettings { settings: set });
+    let with = d.hash();
+    assert_ne!(with, before);
+    assert_ne!(with, three);
+    // Saved and opened: the setting, the hash and the nesting come back.
+    let json = serde_json::to_string(&d.model().snapshot()).unwrap();
+    assert!(json.contains("\"minStrip\""), "{json}");
+    let back =
+        sawhorse_kernel::Model::from_snapshot(&serde_json::from_str(&json).unwrap()).unwrap();
+    assert_eq!(back.hash_hex(), d.model().hash_hex());
+    assert_eq!(back.stock_library().settings.min_strip, Some(2.0 * IN));
+    assert_eq!(
+        back.nest(&NestOptions::default()).hash,
+        d.model().nest(&NestOptions::default()).hash
+    );
+    // Out of range: a typed refusal that changes nothing.
+    let e = d
+        .apply(&Op::SetNestSettings {
+            settings: NestSettings {
+                min_strip: Some(-1.0),
+                ..st
+            },
+        })
+        .unwrap_err();
+    assert!(!e.is_bug(), "{e}");
+    assert_eq!(d.hash(), with);
+    // Undo takes it back to 3 in and then to the rule, Redo forward again; cleared, the old
+    // hash and no "minStrip" in the file.
+    d.undo().unwrap();
+    assert_eq!(d.hash(), three);
+    d.undo().unwrap();
+    assert_eq!(d.hash(), before);
+    d.redo().unwrap();
+    d.redo().unwrap();
+    assert_eq!(d.hash(), with);
+    ok(&mut d, Op::SetNestSettings { settings: st });
+    assert_eq!(d.hash(), before);
+    assert!(
+        !serde_json::to_string(&d.model().snapshot())
+            .unwrap()
+            .contains("minStrip")
+    );
+}
+
+/// The strip widths (in) of one part `part_w` in wide and 20 in long glued from a library of
+/// only `board_w` x 96 in boards of 3/4 in: no joint loss, kerf 1/8 in, the minimum strip
+/// given. `None` when it is not glued.
+fn glued_from(board_w: f64, part_w: f64, min_strip: Option<f64>) -> Option<Vec<f64>> {
+    let list = list_of(&[(0.75, part_w, 20.0, 1, Grain::Length, false, 0)], 0);
+    let mut lib = StockLibrary::builtin();
+    lib.defaults.clear();
+    lib.stocks = vec![StockDef {
+        name: "Board".into(),
+        kind: StockKind::Board,
+        length: 96.0 * IN,
+        width: board_w * IN,
+        thickness: 0.75 * IN,
+        nominal: None,
+        grain: StockGrain::Length,
+    }];
+    let st = NestSettings {
+        kerf: IN / 8.0,
+        joint_loss: 0.0,
+        min_strip,
+        ..NestSettings::default()
+    };
+    let n = nest_list(&list, &lib, st);
+    check_nesting_of(&list, &n).unwrap_or_else(|e| panic!("{part_w} in, {min_strip:?}: {e}"));
+    n.glue_ups
+        .first()
+        .map(|g| g.widths.iter().map(|w| w / IN).collect())
+}
+
+fn widths_are(got: Option<Vec<f64>>, want: &[f64]) {
+    let got = got.expect("glued");
+    assert!(
+        got.len() == want.len() && got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-9),
+        "{got:?}, want {want:?}"
+    );
+}
+
+/// #57: a set minimum strip evens out the last strip with the one before it when it is
+/// narrower than the setting, or half the board when that is smaller; the #56 rule's
+/// quarter-board cap is the default's only. 0 never evens out: the last strip has only to
+/// clear the kerf and 1 mm, as before #56.
+#[test]
+fn a_set_minimum_strip_evens_the_last_strip_up_to_half_the_board() {
+    // Absent: the #56 rule, 1 1/2 in on a 6 in board. A 1 1/2 in last strip stays.
+    widths_are(glued_from(6.0, 13.5, None), &[6.0, 6.0, 1.5]);
+    widths_are(glued_from(6.0, 12.25, None), &[6.0, 3.125, 3.125]);
+    // Set to 2 in, the 1 1/2 in last strip is evened out with the full one before it.
+    widths_are(glued_from(6.0, 13.5, Some(2.0 * IN)), &[6.0, 3.75, 3.75]);
+    widths_are(glued_from(6.0, 14.0, Some(2.0 * IN)), &[6.0, 6.0, 2.0]);
+    // Set past half the board, it holds at half: 3 in on a 6 in board.
+    widths_are(glued_from(6.0, 14.99, Some(4.0 * IN)), &[6.0, 4.495, 4.495]);
+    widths_are(glued_from(6.0, 15.0, Some(4.0 * IN)), &[6.0, 6.0, 3.0]);
+    widths_are(glued_from(6.0, 15.01, Some(4.0 * IN)), &[6.0, 6.0, 3.01]);
+    // On a 2 in board the rule's quarter cap (1/2 in) leaves a 0.6 in last strip; a set
+    // 3/4 in is what it says (under half the board, 1 in).
+    widths_are(glued_from(2.0, 4.6, None), &[2.0, 2.0, 0.6]);
+    widths_are(glued_from(2.0, 4.6, Some(0.75 * IN)), &[2.0, 1.3, 1.3]);
+    // 0: never evened out. A 1/4 in last strip stays; one narrower than the kerf is refused
+    // as before #56, where the rule would have evened it out.
+    widths_are(glued_from(6.0, 12.25, Some(0.0)), &[6.0, 6.0, 0.25]);
+    widths_are(glued_from(6.0, 12.0625, None), &[6.0, 3.03125, 3.03125]);
+    assert_eq!(glued_from(6.0, 12.0625, Some(0.0)), None);
+}
+
+/// #57 (lane 56): the board a part is glued from is chosen with the setting it is planned
+/// with. A 12 1/16 x 20 in part, kerf 1/8 in, no joint loss, on a library of 4/4 x 6 x 96
+/// then 4/4 x 4 1/2 x 96. Both take three strips, so library order decides:
+/// - 6 in: 6 + 6 + 1/16 in. The rule evens the 1/16 in out (under 1 1/2 in), 6 + 3 1/32 +
+///   3 1/32 in; set to 0 it stays, narrower than the kerf, and the board is refused.
+/// - 4 1/2 in: 4 1/2 + 4 1/2 + 3 1/16 in, over 1 1/8 in (a quarter of the board), so the
+///   same with the setting absent or 0.
+///
+/// Absent, the 6 in board glues it. Set to 0, the 4 1/2 in board does; a choice made as if
+/// the setting were absent takes the 6 in board, which then cannot make it, and the part is
+/// left on no stock.
+#[test]
+fn the_board_a_part_is_glued_from_is_chosen_with_the_minimum_strip() {
+    let nest = |min_strip: Option<f64>| {
+        let list = list_of(&[(0.75, 12.0625, 20.0, 1, Grain::Length, false, 0)], 0);
+        let mut lib = StockLibrary::builtin();
+        lib.defaults.clear();
+        lib.stocks = [(6.0, "4/4 x 6 x 96"), (4.5, "4/4 x 4 1/2 x 96")]
+            .into_iter()
+            .map(|(w, name)| StockDef {
+                name: name.into(),
+                kind: StockKind::Board,
+                length: 96.0 * IN,
+                width: w * IN,
+                thickness: 0.75 * IN,
+                nominal: None,
+                grain: StockGrain::Length,
+            })
+            .collect();
+        let st = NestSettings {
+            kerf: IN / 8.0,
+            joint_loss: 0.0,
+            min_strip,
+            ..NestSettings::default()
+        };
+        let n = nest_list(&list, &lib, st);
+        check_nesting_of(&list, &n).unwrap_or_else(|e| panic!("{min_strip:?}: {e}"));
+        n
+    };
+    let n = nest(None);
+    assert!(n.unplaced.is_empty(), "{:#?}", n.unplaced);
+    let s = strips_of(&n, 0);
+    assert!(s.iter().all(|(st, _)| st == "4/4 x 6 x 96"), "{s:?}");
+    widths_are(
+        Some(s.iter().map(|(_, w)| *w).collect()),
+        &[6.0, 3.03125, 3.03125],
+    );
+    let n = nest(Some(0.0));
+    assert!(n.unplaced.is_empty(), "set to 0: {:#?}", n.unplaced);
+    let s = strips_of(&n, 0);
+    assert!(s.iter().all(|(st, _)| st == "4/4 x 4 1/2 x 96"), "{s:?}");
+    widths_are(
+        Some(s.iter().map(|(_, w)| *w).collect()),
+        &[4.5, 4.5, 3.0625],
+    );
+    assert_eq!(n.glue_ups.len(), 1);
+    assert_eq!(n.glue_ups[0].stock, "4/4 x 4 1/2 x 96");
+}
+
+/// #57, to the last bit: the setting's range ends at 12 in, written 0.3048 m (12 in typed,
+/// `12 * 0.0254`, rounds a hair under it and is taken too), and the cap is exactly half the
+/// board. A last strip of exactly half the board stays; one a hair under it is evened out,
+/// never under half.
+#[test]
+fn the_minimum_strip_s_bounds_hold_to_the_last_bit() {
+    use sawhorse_kernel::nesting::glue_minimum;
+    let st = NestSettings::default();
+    let check = |m: f64| {
+        NestSettings {
+            min_strip: Some(m),
+            ..st
+        }
+        .check()
+    };
+    for good in [0.0, 12.0 * IN, 0.3048] {
+        assert!(check(good).is_ok(), "{good:e}");
+    }
+    for bad in [0.3048f64.next_up(), 12.01 * IN, 0.0f64.next_down()] {
+        assert!(check(bad).is_err(), "{bad:e}");
+    }
+    for board in [2.0 * IN, 3.0 * IN, 6.0 * IN, 0.125, 0.1] {
+        let half: f64 = 0.5 * board;
+        for (set, want) in [
+            (half.next_down(), half.next_down()),
+            (half, half),
+            (half.next_up(), half),
+            (0.3048, half),
+        ] {
+            assert_eq!(
+                glue_minimum(board, Some(set)).to_bits(),
+                want.to_bits(),
+                "{board:e} {set:e}"
+            );
+        }
+    }
+    // A 0.1875 m part on 0.125 m boards, no joint loss: its filler is exactly 0.0625 m, half
+    // the board. Set past half, the filler stays; a part one step narrower is evened out.
+    let strips = |w: f64| {
+        let mut list = list_of(&[(0.75, 1.0, 20.0, 1, Grain::Length, false, 0)], 0);
+        list.rows[0].size[1] = w;
+        let mut lib = StockLibrary::builtin();
+        lib.defaults.clear();
+        lib.stocks = vec![StockDef {
+            name: "Board".into(),
+            kind: StockKind::Board,
+            length: 96.0 * IN,
+            width: 0.125,
+            thickness: 0.75 * IN,
+            nominal: None,
+            grain: StockGrain::Length,
+        }];
+        let st = NestSettings {
+            kerf: IN / 8.0,
+            joint_loss: 0.0,
+            min_strip: Some(0.1),
+            ..NestSettings::default()
+        };
+        let n = nest_list(&list, &lib, st);
+        check_nesting_of(&list, &n).unwrap();
+        n.glue_ups[0].widths.clone()
+    };
+    assert_eq!(strips(0.1875), vec![0.125, 0.0625]);
+    let evened = strips(0.1875f64.next_down());
+    assert_eq!(evened.len(), 2);
+    assert!(
+        evened.iter().all(|w| (0.0625..0.125).contains(w)),
+        "{evened:?}"
+    );
 }
 
 /// Oak rails on the built-in boards, no material defaults, kerf 1/8 in, no trim.
@@ -1611,3 +2256,166 @@ fn the_nesting_golden_is_this_bookshelf() {
         );
     }
 }
+
+// ---- lane 51: a filled sheet or board shows no waste ------------------------------------
+
+/// Plain parts nested with no kerf and no trim (inches), the library with no defaults.
+fn filled(parts: &[(f64, f64, f64, usize, bool)]) -> Nesting {
+    let rows: Vec<_> = parts
+        .iter()
+        .map(|&(t, w, l, q, sheet)| (t, w, l, q, Grain::Length, sheet, 0u8))
+        .collect();
+    let list = list_of(&rows, 0);
+    let mut lib = StockLibrary::builtin();
+    lib.defaults.clear();
+    let st = NestSettings {
+        kerf: 0.0,
+        trim: 0.0,
+        algorithm: NestAlgorithm::Guillotine,
+        ..NestSettings::default()
+    };
+    let n = nest_list(&list, &lib, st);
+    check_nesting_of(&list, &n).unwrap();
+    n
+}
+
+/// The parts' areas on a piece added up as the nesting adds them, before lane 51.
+fn raw_parts(p: &StockPiece) -> f64 {
+    p.placements.iter().map(|q| q.dx * q.dy).sum()
+}
+
+/// Every piece, group and the totals of a nesting whose stock is all filled: exactly no
+/// waste, with a positive sign, and an efficiency of exactly 1.
+fn all_full(n: &Nesting) {
+    for p in &n.pieces {
+        assert_eq!(p.parts_area, p.stock_area, "piece {}", p.index);
+        assert_eq!(
+            p.waste_area.to_bits(),
+            0.0f64.to_bits(),
+            "piece {}",
+            p.index
+        );
+        assert_eq!(p.efficiency, 1.0, "piece {}", p.index);
+    }
+    for g in &n.totals.groups {
+        assert_eq!(g.parts_area, g.stock_area, "group {}", g.stock);
+        assert_eq!(g.efficiency, 1.0, "group {}", g.stock);
+    }
+    let t = &n.totals;
+    assert_eq!(t.parts_area, t.stock_area);
+    assert_eq!((t.stock_area - t.parts_area).to_bits(), 0.0f64.to_bits());
+    assert_eq!(t.efficiency, 1.0);
+}
+
+/// Nine 16 x 32 in parts fill a 4 x 8 sheet, and three 4 x 32 in parts a 4/4 x 4 x 96
+/// board, with no kerf and no trim; added up, their areas came to a hair more than the
+/// stock's (4.4e-16 m² and 2.8e-17 m²), which the Nesting panel showed as "-0.00 sq ft
+/// waste". Now each reads exactly no waste and 100%.
+#[test]
+fn parts_that_fill_a_sheet_or_a_board_leave_exactly_no_waste() {
+    let sheet = filled(&[(23.0 / 32.0, 16.0, 32.0, 9, true)]);
+    let board = filled(&[(0.75, 4.0, 32.0, 3, false)]);
+    for (n, stock, parts) in [(&sheet, "4 x 8 sheet, 3/4", 9), (&board, "4/4 x 4 x 96", 3)] {
+        assert_eq!((n.totals.unplaced, n.pieces.len()), (0, 1), "{stock}");
+        let p = &n.pieces[0];
+        assert_eq!((p.stock.as_str(), p.placements.len()), (stock, parts));
+        // The case is the one rounding put over: the plain sum is more than the stock.
+        assert!(raw_parts(p) > p.stock_area, "{stock}: {:e}", raw_parts(p));
+        all_full(n);
+    }
+}
+
+/// A part exactly a 5 x 5 Baltic birch sheet, ten of them: each sheet's area is its own,
+/// but ten sheets' areas added one by one came to more than the sheet's area times ten,
+/// so the group read a hair over 100%. Now the group and the totals read exactly 1.
+#[test]
+fn ten_parts_each_a_whole_sheet_fill_their_group_exactly() {
+    let n = filled(&[(18.0 / 25.4, 60.0, 60.0, 10, true)]);
+    assert_eq!(n.totals.unplaced, 0);
+    assert_eq!(n.totals.groups.len(), 1);
+    let g = &n.totals.groups[0];
+    assert_eq!((g.stock.as_str(), g.count), ("5 x 5 Baltic birch, 3/4", 10));
+    let one = n.pieces[0].stock_area;
+    let added = n.pieces.iter().fold(0.0, |s, p| s + raw_parts(p));
+    assert!(added > one * 10.0, "{added:e} {:e}", one * 10.0);
+    all_full(&n);
+}
+
+/// What is more than rounding can make still shows: a part half a nanometre larger than the
+/// 5 x 5 sheet each way (inside the fits' 1 nm slack) comes to about 1.5e-9 m² more than
+/// the sheet, so its waste is below zero and its efficiency over 1.
+#[test]
+fn parts_truly_larger_than_their_stock_still_show() {
+    let over = 0.5e-9 / IN;
+    let n = filled(&[(18.0 / 25.4, 60.0 + over, 60.0 + over, 1, true)]);
+    assert_eq!((n.totals.unplaced, n.pieces.len()), (0, 1));
+    let p = &n.pieces[0];
+    assert_eq!(p.parts_area, raw_parts(p));
+    assert!(p.waste_area < -1e-9, "{:e}", p.waste_area);
+    assert!(p.efficiency > 1.0);
+    assert!(n.totals.groups[0].efficiency > 1.0);
+    assert!(n.totals.efficiency > 1.0);
+    // The rule itself, at and past its slack.
+    let slack = |terms: usize| (terms as f64 + 2.0) * f64::EPSILON;
+    assert_eq!(up_to_stock(1.0 + slack(9), 1.0, 9), 1.0);
+    assert_eq!(
+        up_to_stock(1.0 + 2.0 * slack(9), 1.0, 9),
+        1.0 + 2.0 * slack(9)
+    );
+    assert_eq!(up_to_stock(0.5, 1.0, 9), 0.5);
+    assert_eq!(up_to_stock(-0.0f64, 1.0, 0).to_bits(), (-0.0f64).to_bits());
+}
+
+/// Stock the parts do not fill reads bit for bit as before lane 51: every piece's, group's
+/// and total's numbers equal the sums and quotients the nesting worked them out with.
+#[test]
+fn stock_not_filled_reads_bit_for_bit_as_before() {
+    let (mut d, s) = bookshelf();
+    let mut nestings = vec![nest(&d)];
+    plywood(&mut d, &s);
+    nestings.push(nest(&d));
+    nestings.push(filled(&[(23.0 / 32.0, 16.0, 31.0, 9, true)]));
+    nestings.push(rails(1.5, 40.0, 4));
+    for n in &nestings {
+        let mut groups: Vec<(f64, f64)> = vec![(0.0, 0.0); n.totals.groups.len()];
+        for p in &n.pieces {
+            let parts = raw_parts(p);
+            let stock = p.length * p.width;
+            assert!(parts < stock);
+            assert_eq!(p.parts_area.to_bits(), parts.to_bits());
+            assert_eq!(p.stock_area.to_bits(), stock.to_bits());
+            assert_eq!(p.waste_area.to_bits(), (stock - parts).to_bits());
+            assert_eq!(p.efficiency.to_bits(), (parts / stock).to_bits());
+            groups[p.group].0 += parts;
+            groups[p.group].1 = stock * p.count as f64;
+        }
+        for (g, (parts, stock)) in n.totals.groups.iter().zip(&groups) {
+            assert_eq!(g.parts_area.to_bits(), parts.to_bits());
+            assert_eq!(g.stock_area.to_bits(), stock.to_bits());
+            assert_eq!(g.efficiency.to_bits(), (parts / stock).to_bits());
+        }
+        let parts = n.pieces.iter().fold(0.0, |s, p| s + raw_parts(p));
+        let stock = n.pieces.iter().fold(0.0, |s, p| s + p.length * p.width);
+        let t = &n.totals;
+        assert_eq!(t.parts_area.to_bits(), parts.to_bits());
+        assert_eq!(t.stock_area.to_bits(), stock.to_bits());
+        assert_eq!(t.efficiency.to_bits(), (parts / stock).to_bits());
+    }
+    // And the bookshelf's totals as they were (6,105 and 10,368 in²), to the bit.
+    let t = &nestings[0].totals;
+    assert_eq!(
+        (
+            t.parts_area.to_bits(),
+            t.stock_area.to_bits(),
+            t.efficiency.to_bits()
+        ),
+        (BOOKSHELF_BITS[0], BOOKSHELF_BITS[1], BOOKSHELF_BITS[2])
+    );
+}
+
+/// The bookshelf's total parts area, stock area and efficiency before lane 51 (f64 bits).
+const BOOKSHELF_BITS: [u64; 3] = [
+    4616051586779419158,
+    4619217184161248456,
+    4603478937856444795,
+];

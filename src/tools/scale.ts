@@ -183,11 +183,22 @@ export class ScaleTool extends Tool {
     this.fresh = false;
   }
 
+  /** #76: the box and its grips go round the selection as it is now (after Undo they stood
+   * where the scaled shape had been; after New or Close, over an empty model), and the scale
+   * a typed value would redo is forgotten: it is no longer the last step, and redoing it
+   * starts with an Undo, which would take the step before it. */
+  modelChanged(): void {
+    this.target = null;
+    this.hot = null;
+    this.last = null;
+    void this.refreshTarget(null);
+  }
+
   activate(): void {
     this.target = null;
     this.hot = null;
     void this.refreshTarget(null);
-    this.host.status("Drag a grip (or click it, move, click). Shift: uniform. Ctrl: about the centre. Type 2, or 48in.");
+    this.host.status("Drag a grip (or click it, move, click). Hold Shift: uniform. Tap Ctrl: switch between the opposite grip and the centre. Type 2, or 48in.");
   }
 
   inferContext(): InferContext {
@@ -306,7 +317,7 @@ export class ScaleTool extends Tool {
           const hot = this.nearestGrip(e.x, e.y);
           if (hot !== this.hot) {
             this.hot = hot;
-            if (hot) h.status(`${gripName(hot)[0].toUpperCase()}${gripName(hot).slice(1)}: drag it, or click it and move. Shift: uniform. Ctrl: about the centre.`);
+            if (hot) h.status(`${gripName(hot)[0].toUpperCase()}${gripName(hot).slice(1)}: drag it, or click it and move. Hold Shift: uniform. Tap Ctrl: switch between the opposite grip and the centre.`);
           }
         }
         h.changed();

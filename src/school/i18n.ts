@@ -137,6 +137,18 @@ const IT: Record<string, string> = {
   "Close this model and start an empty one (asks first if there are unsaved changes)": "Chiudi questo modello e iniziane uno vuoto (prima chiede, se ci sono modifiche non salvate)",
   "New model.": "Nuovo modello.",
   "Joint loss": "Perdita per giunto",
+  // Sawhorse 0.1.0-alpha.7: glue-ups, unsaved work, Follow Me and Scale hints
+  "Minimum strip": "Striscia minima",
+  "Minimum strip: a glue-up's last strip narrower than this is evened out with the one before it, never past half the board. Empty: 1 1/2 in, or a quarter of the board if less":
+    "Striscia minima: l'ultima striscia di un incollaggio più stretta di questo valore viene pareggiata con quella prima, mai oltre metà tavola. Vuoto: 1 1/2 in, o un quarto della tavola se è meno",
+  Discard: "Scarta",
+  "Show the offer to restore or discard it": "Mostra di nuovo la proposta di recuperare o scartare il lavoro",
+  "1 older set of unsaved work is set aside too.": "Anche un altro lavoro non salvato, più vecchio, è stato messo da parte.",
+  "Unsaved work discarded.": "Lavoro non salvato scartato.",
+  "Select the path first (edges end to end, or a face to go round its edge), then press W and click the profile.":
+    "Prima seleziona il percorso (spigoli uno dopo l'altro, o una faccia per seguirne il bordo), poi premi W e clicca il profilo.",
+  "Drag a grip (or click it, move, click). Hold Shift: uniform. Tap Ctrl: switch between the opposite grip and the centre. Type 2, or 48in.":
+    "Trascina una maniglia (o cliccala, muovi, clicca). Tieni premuto Maiusc: scala uniforme. Tocca Ctrl: passa tra la maniglia opposta e il centro. Scrivi 2, oppure 48in.",
   "Three-quarter perspective view": "Vista prospettica a tre quarti",
   Perspective: "Prospettiva",
   Views: "Viste",

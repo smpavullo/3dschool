@@ -11,6 +11,7 @@ import DxfParser from "dxf-parser";
 // back with every part in them. Every layout is checked for overlaps and kerf gaps.
 import { buildBookshelf, hint, ready } from "./bookshelf-build";
 import { buildShz, openShz } from "./shz";
+import { setUnits } from "./helpers";
 import { readPdf } from "../src/cutlist/pdf";
 
 const IN = 0.0254;
@@ -37,7 +38,7 @@ interface Piece {
 }
 interface Nest {
   algorithm: string;
-  settings: { kerf: number; trim: number; algorithm: string };
+  settings: { kerf: number; trim: number; algorithm: string; minStrip?: number };
   pieces: Piece[];
   unplaced: { tag: string; name: string; reason: string }[];
   totals: { sheets: number; boards: number; parts_in: number; placed: number; unplaced: number; efficiency: number };
@@ -298,9 +299,11 @@ test("narrow rails share a board's width: one board in the panel, two sections o
 });
 
 // #49: a 15 x 3/4 x 40 in panel is wider than the widest built-in board (4/4 x 12 x 96).
-// Before, it was on no stock ("larger than"); now it is glued up from a 12 in strip and a
-// 3 1/8 in filler (15 + 1/8 in joint loss - 12), both on one board, tagged 1.1 and 1.2,
-// and listed as a glue-up. Typing a joint loss of 1/16 in re-plans the filler to 3 1/16.
+// Before, it was on no stock ("larger than"); now it is glued up, both strips on one board,
+// tagged 1.1 and 1.2, and listed as a glue-up. #56: 4/4 x 8 and 4/4 x 12 both make it from
+// two strips, and with nothing else of that wood library order decides: an 8 in strip and a
+// 7 1/8 in filler (15 + 1/8 in joint loss - 8) on 4/4 x 8 (#53: 12 + 3 1/8 in). Typing a
+// joint loss of 1/16 in re-plans the filler to 7 1/16.
 test("a panel wider than every board is glued up from strips, and the joint loss re-plans it", async ({ page }) => {
   test.setTimeout(90_000);
   const shz = await buildShz((apply) => {
@@ -315,15 +318,15 @@ test("a panel wider than every board is glued up from strips, and the joint loss
   const section = page.getByTestId("nesting");
   await expect(section).toBeVisible();
   await expect(section.getByTestId("nest-unplaced")).toHaveCount(0);
-  await expect(section.getByTestId("nest-glued")).toContainText("1 Panel: glued up from 2 strips of 4/4 x 12 x 96, 12 + 3 1/8 in");
+  await expect(section.getByTestId("nest-glued")).toContainText("1 Panel: glued up from 2 strips of 4/4 x 8 x 96, 8 + 7 1/8 in");
   const n = await nest(page);
   expect([n.totals.boards, n.totals.placed, n.totals.unplaced]).toEqual([1, 1, 0]);
   checkLayout(n);
   const [p] = n.pieces;
-  expect(p.stock).toBe("4/4 x 12 x 96");
+  expect(p.stock).toBe("4/4 x 8 x 96");
   expect(p.placements.map((q) => [q.tag, Math.round((q.dy / IN) * 1e6) / 1e6, Math.round((q.dx / IN) * 1e6) / 1e6]).sort()).toEqual([
-    ["1.1", 12, 40],
-    ["1.2", 3.125, 40],
+    ["1.1", 8, 40],
+    ["1.2", 7.125, 40],
   ]);
   // Both strips drawn and tagged on the board, and listed at their own widths.
   const tagsDrawn = await section.locator("figure.nest-piece svg.nest-diagram g.part").evaluateAll((gs) => gs.map((g) => g.getAttribute("data-tag")).sort());
@@ -331,14 +334,654 @@ test("a panel wider than every board is glued up from strips, and the joint loss
   await section.locator("figure.nest-piece details summary").first().click({ position: { x: 4, y: 4 } });
   const listed = section.locator("figure.nest-piece ul.nest-parts li");
   await expect(listed).toHaveCount(2);
-  await expect(listed.filter({ hasText: "1.1 Panel, strip 1 of 2 12 × 40" })).toHaveCount(1);
-  await expect(listed.filter({ hasText: "1.2 Panel, strip 2 of 2 3 1/8 × 40" })).toHaveCount(1);
+  await expect(listed.filter({ hasText: "1.1 Panel, strip 1 of 2 8 × 40" })).toHaveCount(1);
+  await expect(listed.filter({ hasText: "1.2 Panel, strip 2 of 2 7 1/8 × 40" })).toHaveCount(1);
   await expect(section.getByTestId("nest-note")).toContainText("joint loss 1/8 in");
-  // A thinner joint: the filler narrows to 3 1/16 in.
+  // A thinner joint: the filler narrows to 7 1/16 in.
   const joint = section.getByLabel("Joint loss");
   await expect(joint).toHaveValue("1/8 in");
   await joint.fill("1/16");
   await joint.press("Enter");
-  await expect(section.getByTestId("nest-glued")).toContainText("12 + 3 1/16 in");
+  await expect(section.getByTestId("nest-glued")).toContainText("8 + 7 1/16 in");
   await expect(joint).toHaveValue("1/16 in");
+});
+
+// #56 point 4: the same 15 in panel. While the Nesting section is open the cut list row says
+// what it is glued from, and the board's caption counts the panel once, in its two strips.
+// Closed, the row reads as before.
+test("a glued part's cut list row says what it is glued from, and its board counts it once", async ({ page }) => {
+  test.setTimeout(90_000);
+  const shz = await buildShz((apply) => {
+    const drawn = apply({ op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: [[0, 0, 0], [40 * IN, 0, 0], [40 * IN, 15 * IN, 0], [0, 15 * IN, 0]], closed: true });
+    const made = apply({ op: "extrude", sketch: drawn.sketch, region: drawn.inside, distance: 0.75 * IN });
+    apply({ op: "make_component", items: [{ object: made.object }], name: "Panel" });
+  });
+  await openShz(page, shz, 1, "panel.shz");
+  await page.getByRole("tab", { name: "Cut list" }).click();
+  const row = page.locator('.cutlist tr[data-part="Panel"]');
+  await expect(row).toBeVisible();
+  await expect(row).not.toContainText("glued");
+  await page.getByRole("button", { name: "Nesting ›" }).click();
+  const section = page.getByTestId("nesting");
+  await expect(section.getByTestId("nest-glued")).toContainText("1 Panel: glued up from 2 strips of 4/4 x 8 x 96");
+  await expect(row.locator("td.part")).toContainText("glued from 2 (4/4 x 8 x 96)");
+  const piece = section.locator("figure.nest-piece").first();
+  await expect(piece.locator("details summary")).toContainText("1 part in 2 strips");
+  await expect(piece.locator("svg.nest-diagram")).toHaveAttribute("aria-label", /: 1 part in 2 strips, /);
+  // The SVG file's title says the same.
+  const [svg] = await downloads(page, 1, () => piece.getByRole("button", { name: /SVG/ }).click());
+  expect(svg.bytes.toString("utf8")).toContain("1 part in 2 strips");
+  // Closed, the row reads as before.
+  await page.getByRole("button", { name: "Nesting ‹" }).click();
+  await expect(section).toHaveCount(0);
+  await expect(row).not.toContainText("glued");
+});
+
+// #56 point 4: the note is never one worked out before the last change. Three 15 in panels,
+// one hidden. Every change to the row is recorded as it is made, with the status line beside
+// it: Visible only (the list then counts two copies, a nesting from before still three, which
+// would read "3 glued from 2"), the panel's stock set to 4/4 x 12 (the nesting from before
+// says 4/4 x 8), and Undo (the nesting from before says 4/4 x 12). The nesting is asked again
+// 200 ms after each, so a note kept from before would be there for that long.
+test("a glued row's note is never one from before the last change", async ({ page }) => {
+  test.setTimeout(90_000);
+  const shz = await buildShz((apply) => {
+    const drawn = apply({ op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: [[0, 0, 0], [40 * IN, 0, 0], [40 * IN, 15 * IN, 0], [0, 15 * IN, 0]], closed: true });
+    const made = apply({ op: "extrude", sketch: drawn.sketch, region: drawn.inside, distance: 0.75 * IN });
+    const comp = apply({ op: "make_component", items: [{ object: made.object }], name: "Panel" }) as { instance: number };
+    const copies = apply({ op: "array", objects: [], nodes: [comp.instance], xform: { linear: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], translation: [0, 0, 2 * IN] }, count: 2 }) as { nodes: number[] };
+    apply({ op: "set_hidden", items: [{ node: copies.nodes[1] }], hidden: true });
+  });
+  await openShz(page, shz, 3, "panels.shz");
+  await page.getByRole("tab", { name: "Cut list" }).click();
+  await page.getByRole("button", { name: "Nesting ›" }).click();
+  const note = page.locator('.cutlist tr[data-part="Panel"] td.part');
+  await expect(note).toContainText("glued from 2 (4/4 x 8 x 96)");
+  await page.evaluate(() => {
+    const w = window as unknown as { __seen: string[] };
+    w.__seen = [];
+    const record = () => {
+      const td = document.querySelector('.cutlist tr[data-part="Panel"] td.part');
+      const m = /(\d+ )?glued from \d+ \([^)]*\)/.exec(td?.textContent ?? "");
+      const s = `${m ? m[0] : "-"} | ${document.getElementById("hint")?.textContent ?? ""}`;
+      if (w.__seen[w.__seen.length - 1] !== s) w.__seen.push(s);
+    };
+    new MutationObserver(record).observe(document.body, { subtree: true, childList: true, characterData: true });
+  });
+  const seen = () => page.evaluate(() => (window as unknown as { __seen: string[] }).__seen.splice(0));
+  await page.getByLabel("Visible only").check();
+  await expect(page.locator(".cutlist tr[data-part='Panel'] td.n").first()).toHaveText("2");
+  await expect(note).toContainText("glued from 2 (4/4 x 8 x 96)");
+  const vo = await seen();
+  expect(vo.filter((s) => /^\d+ glued/.test(s))).toEqual([]);
+  await page.locator('.cutlist tr[data-part="Panel"]').click({ button: "right" });
+  await page.getByRole("menuitem", { name: /Stock/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Stock for Panel" });
+  await dialog.getByRole("textbox").fill("4/4 x 12 x 96");
+  await dialog.getByRole("button", { name: "Set stock" }).click();
+  await expect(note).toContainText("glued from 2 (4/4 x 12 x 96)");
+  const set = await seen();
+  expect(set.some((s) => /cut from 4\/4 x 12 x 96/.test(s))).toBe(true);
+  expect(set.filter((s) => /4\/4 x 8 x 96\) \|.*cut from 4\/4 x 12 x 96/.test(s))).toEqual([]);
+  await page.getByLabel("Round sizes to").focus();
+  await page.keyboard.press("Control+z");
+  await expect(note).toContainText("glued from 2 (4/4 x 8 x 96)");
+  const undone = await seen();
+  expect(undone.some((s) => /Undone/.test(s))).toBe(true);
+  expect(undone.filter((s) => /4\/4 x 12 x 96\) \|.*Undone/.test(s))).toEqual([]);
+});
+
+// #56 point 4: the note is the pane's only. The 15 in panel's cut list CSV, PDF and labels
+// are saved, and its printed report drawn, with the Nesting section closed, then again with
+// it open and the note showing in the row: the same bytes each time (the cut list PDFs carry
+// no date), and no note in the CSV.
+test("a glued row's note stays out of the cut list's CSV, PDF, labels and print", async ({ page }) => {
+  test.setTimeout(90_000);
+  const shz = await buildShz((apply) => {
+    const drawn = apply({ op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: [[0, 0, 0], [40 * IN, 0, 0], [40 * IN, 15 * IN, 0], [0, 15 * IN, 0]], closed: true });
+    const made = apply({ op: "extrude", sketch: drawn.sketch, region: drawn.inside, distance: 0.75 * IN });
+    apply({ op: "make_component", items: [{ object: made.object }], name: "Panel" });
+  });
+  await openShz(page, shz, 1, "panel.shz");
+  await page.getByRole("tab", { name: "Cut list" }).click();
+  const note = page.locator('.cutlist tr[data-part="Panel"] td.part');
+  await expect(note).toBeVisible();
+  // The cut list's own buttons (the Nesting section has a row of its own below them).
+  const buttons = page.locator(".cutlist .btnrow").first();
+  const saved = async (name: string) => (await downloads(page, 1, () => buttons.getByRole("button", { name, exact: true }).click()))[0].bytes;
+  const printed = async () => {
+    await page.evaluate(() => {
+      (window as unknown as { print: () => void }).print = () => {};
+    });
+    await buttons.getByRole("button", { name: "Print", exact: true }).click();
+    await page.emulateMedia({ media: "print" });
+    const report = page.getByTestId("print-report");
+    await expect(report).toBeVisible();
+    const html = await report.evaluate((e) => e.outerHTML);
+    await page.emulateMedia({ media: "screen" });
+    await page.evaluate(() => document.body.classList.remove("print-cutlist"));
+    return html;
+  };
+  const all = async () => ({ csv: await saved("CSV"), pdf: await saved("PDF"), labels: await saved("Labels"), print: await printed() });
+  await expect(note).not.toContainText("glued");
+  const closed = await all();
+  await page.getByRole("button", { name: "Nesting ›" }).click();
+  await expect(note).toContainText("glued from 2 (4/4 x 8 x 96)");
+  const open = await all();
+  // Still noted after the saves, so every file above was made with the note on screen.
+  await expect(note).toContainText("glued from 2 (4/4 x 8 x 96)");
+  expect(open.csv.equals(closed.csv), "CSV").toBe(true);
+  expect(open.pdf.equals(closed.pdf), "PDF").toBe(true);
+  expect(open.labels.equals(closed.labels), "labels").toBe(true);
+  expect(open.print).toBe(closed.print);
+  expect(open.csv.toString("utf8")).not.toContain("glued from");
+  expect(open.print).not.toContain("glued from");
+});
+
+// #56: a 24 1/4 x 3/4 x 40 in panel takes three strips of 4/4 x 12 (four of 4/4 x 8). Two
+// full strips would leave a 1/2 in filler (24 1/4 + 2 x 1/8 - 24), under the minimum (the
+// smaller of 1 1/2 in and a quarter of the board), so the last two strips are made equal:
+// 12 + 6 1/4 + 6 1/4 in, drawn and listed at those widths.
+test("a glue-up's last strip under the minimum is made equal with the one before it", async ({ page }) => {
+  test.setTimeout(90_000);
+  const shz = await buildShz((apply) => {
+    const drawn = apply({ op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: [[0, 0, 0], [40 * IN, 0, 0], [40 * IN, 24.25 * IN, 0], [0, 24.25 * IN, 0]], closed: true });
+    const made = apply({ op: "extrude", sketch: drawn.sketch, region: drawn.inside, distance: 0.75 * IN });
+    apply({ op: "make_component", items: [{ object: made.object }], name: "Top" });
+  });
+  await openShz(page, shz, 1, "top.shz");
+  await page.getByRole("tab", { name: "Cut list" }).click();
+  await expect(page.locator(".cutlist table")).toBeVisible();
+  await page.getByRole("button", { name: "Nesting ›" }).click();
+  const section = page.getByTestId("nesting");
+  await expect(section).toBeVisible();
+  await expect(section.getByTestId("nest-unplaced")).toHaveCount(0);
+  await expect(section.getByTestId("nest-glued")).toContainText("1 Top: glued up from 3 strips of 4/4 x 12 x 96, 12 + 6 1/4 + 6 1/4 in");
+  const n = await nest(page);
+  expect(n.totals.unplaced).toBe(0);
+  checkLayout(n);
+  const widths = n.pieces
+    .flatMap((p) => p.placements.map((q) => [p.stock, q.tag, Math.round((q.dy / IN) * 1e6) / 1e6]))
+    .sort();
+  expect(widths).toEqual([
+    ["4/4 x 12 x 96", "1.1", 12],
+    ["4/4 x 12 x 96", "1.2", 6.25],
+    ["4/4 x 12 x 96", "1.3", 6.25],
+  ]);
+});
+
+// #57: the same 24 1/4 in top. The Minimum strip field is empty (auto, the #56 rule) until
+// set. Set to 1/4 in, the 1/2 in last strip is wide enough and stays: 12 + 12 + 1/2 in, the
+// footer naming it. Undo takes it back to auto, Redo sets it again, and clearing the field
+// goes back to auto and 12 + 6 1/4 + 6 1/4 in.
+test("the minimum strip re-plans a glue-up's last strip, undoes, and clears back to auto", async ({ page }) => {
+  test.setTimeout(90_000);
+  const shz = await buildShz((apply) => {
+    const drawn = apply({ op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: [[0, 0, 0], [40 * IN, 0, 0], [40 * IN, 24.25 * IN, 0], [0, 24.25 * IN, 0]], closed: true });
+    const made = apply({ op: "extrude", sketch: drawn.sketch, region: drawn.inside, distance: 0.75 * IN });
+    apply({ op: "make_component", items: [{ object: made.object }], name: "Top" });
+  });
+  await openShz(page, shz, 1, "top.shz");
+  await page.getByRole("tab", { name: "Cut list" }).click();
+  await expect(page.locator(".cutlist table")).toBeVisible();
+  await page.getByRole("button", { name: "Nesting ›" }).click();
+  const section = page.getByTestId("nesting");
+  const glued = section.getByTestId("nest-glued");
+  const min = section.getByLabel("Minimum strip");
+  await expect(glued).toContainText("12 + 6 1/4 + 6 1/4 in");
+  await expect(min).toHaveValue("");
+  await expect(min).toHaveAttribute("placeholder", "auto");
+  await expect(section.getByTestId("nest-note")).not.toContainText("min strip");
+  await min.fill("1/4");
+  await min.press("Enter");
+  await expect(glued).toContainText("1 Top: glued up from 3 strips of 4/4 x 12 x 96, 12 + 12 + 1/2 in");
+  await expect(min).toHaveValue("1/4 in");
+  await expect(section.getByTestId("nest-note")).toContainText("joint loss 1/8 in · min strip 1/4 in");
+  await expect(page.locator("#hint")).toContainText("minimum strip 1/4 in");
+  const n = await nest(page);
+  expect(n.settings.minStrip).toBeCloseTo(0.25 * IN, 12);
+  checkLayout(n);
+  // Undo: back to auto. Redo: set again.
+  await page.getByLabel("Round sizes to").focus();
+  await page.keyboard.press("Control+z");
+  await expect(glued).toContainText("12 + 6 1/4 + 6 1/4 in");
+  await expect(min).toHaveValue("");
+  await page.keyboard.press("Control+y");
+  await expect(glued).toContainText("12 + 12 + 1/2 in");
+  await expect(min).toHaveValue("1/4 in");
+  // Cleared: auto again, and the document's settings say nothing of it.
+  await min.fill("");
+  await min.press("Enter");
+  await expect(glued).toContainText("12 + 6 1/4 + 6 1/4 in");
+  await expect(min).toHaveValue("");
+  expect("minStrip" in (await nest(page)).settings).toBe(false);
+});
+
+// #58: Built-in stock says what it puts back in the document's units. In millimetres a kerf
+// of 2 mm and a minimum strip of 30 mm are set, then Built-in stock: its tooltip and the
+// status line read the kerf and joint loss as the Kerf field writes them (still 1/8 in until
+// a metric set exists), the minimum strip back to auto, and the fields agree. In inches the
+// tooltip reads 1/8 in.
+test("Built-in stock says what it puts back in the document's units", async ({ page }) => {
+  test.setTimeout(90_000);
+  const shz = await buildShz((apply) => {
+    const drawn = apply({ op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: [[0, 0, 0], [40 * IN, 0, 0], [40 * IN, 10 * IN, 0], [0, 10 * IN, 0]], closed: true });
+    const made = apply({ op: "extrude", sketch: drawn.sketch, region: drawn.inside, distance: 0.75 * IN });
+    apply({ op: "make_component", items: [{ object: made.object }], name: "Shelf" });
+  });
+  await openShz(page, shz, 1, "shelf.shz");
+  await setUnits(page, "mm");
+  await page.getByRole("tab", { name: "Cut list" }).click();
+  await expect(page.locator(".cutlist table")).toBeVisible();
+  await page.getByRole("button", { name: "Nesting ›" }).click();
+  const section = page.getByTestId("nesting");
+  const kerf = section.getByLabel("Kerf", { exact: true });
+  const joint = section.getByLabel("Joint loss");
+  const min = section.getByLabel("Minimum strip");
+  await kerf.fill("2");
+  await kerf.press("Enter");
+  await expect(kerf).toHaveValue("2 mm");
+  await min.fill("30");
+  await min.press("Enter");
+  await expect(min).toHaveValue("30 mm");
+  await section.getByRole("button", { name: "Stock…" }).click();
+  const dlg = page.getByRole("dialog", { name: "Stock" });
+  const reset = dlg.getByRole("button", { name: "Built-in stock" });
+  await expect(reset).toHaveAttribute("title", "Back to the built-in sheets and boards: kerf 3.18 mm, no trim, joint loss 3.18 mm, minimum strip auto, table saw");
+  await reset.click();
+  await expect(page.locator("#hint")).toContainText("Stock back to the built-in sheets and boards: kerf 3.18 mm, no trim, joint loss 3.18 mm, minimum strip auto, table saw.");
+  await dlg.getByRole("button", { name: "Done" }).click();
+  await expect(kerf).toHaveValue("3.18 mm");
+  await expect(joint).toHaveValue("3.18 mm");
+  await expect(min).toHaveValue("");
+  const n = await nest(page);
+  expect(n.settings.kerf).toBe(IN / 8);
+  expect("minStrip" in n.settings).toBe(false);
+  // In inches the same button reads 1/8 in.
+  await setUnits(page, "frac-in");
+  await section.getByRole("button", { name: "Stock…" }).click();
+  await expect(dlg.getByRole("button", { name: "Built-in stock" })).toHaveAttribute("title", "Back to the built-in sheets and boards: kerf 1/8 in, no trim, joint loss 1/8 in, minimum strip auto, table saw");
+  // Decimal inches chosen with the dialog open: the tooltip follows, and after a 0.1 in kerf
+  // the status line reads as the Kerf field then does, 0.125 in.
+  await setUnits(page, "in");
+  await expect(reset).toHaveAttribute("title", "Back to the built-in sheets and boards: kerf 0.125 in, no trim, joint loss 0.125 in, minimum strip auto, table saw");
+  await dlg.getByRole("button", { name: "Done" }).click();
+  await kerf.fill("0.1");
+  await kerf.press("Enter");
+  await expect(kerf).toHaveValue("0.1 in");
+  await section.getByRole("button", { name: "Stock…" }).click();
+  await reset.click();
+  await expect(page.locator("#hint")).toContainText("Stock back to the built-in sheets and boards: kerf 0.125 in, no trim, joint loss 0.125 in, minimum strip auto, table saw.");
+  await dlg.getByRole("button", { name: "Done" }).click();
+  await expect(kerf).toHaveValue("0.125 in");
+});
+
+// An edit sets the Nesting pane busy until its nesting is worked out again, 200 ms later.
+// `nestEdit` starts counting the times the pane stops being busy; `nestSettled` waits for one
+// and for the pane to be idle, so the fields then show the document as it is.
+function nestEdit(page: Page) {
+  return page.evaluate(() => {
+    const w = window as unknown as { __nestDone: number; __nestWatch?: MutationObserver };
+    const el = document.querySelector('[data-testid="nesting"] .nest-body')!;
+    w.__nestWatch?.disconnect();
+    w.__nestDone = 0;
+    w.__nestWatch = new MutationObserver(() => {
+      if (el.getAttribute("aria-busy") === "false") w.__nestDone++;
+    });
+    w.__nestWatch.observe(el, { attributes: true, attributeFilter: ["aria-busy"] });
+  });
+}
+async function nestSettled(page: Page) {
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __nestDone: number }).__nestDone)).toBeGreaterThan(0);
+  await expect(page.getByTestId("nesting").locator(".nest-body")).toHaveAttribute("aria-busy", "false");
+}
+
+// #93: a length typed into a Nesting field that reads the same as the old one (3.18 in a
+// millimetre document, where the built-in 1/8 in kerf reads 3.18 mm) is stored as typed and
+// the field shows it with its unit again, after Enter or leaving the field, and through
+// Undo and Redo. The pause stores it too and leaves the typed text until the field is left.
+// A length that reads differently is never shown as the old reading while it is worked out.
+// The pane works the nesting out again 200 ms after an edit (the fields show the settings
+// stored now since #100): every step that changes the document waits for that before it
+// reads or types again.
+test("a Nesting length that reads the same as before is shown with its unit (#93)", async ({ page }) => {
+  test.setTimeout(90_000);
+  const shz = await buildShz((apply) => {
+    const drawn = apply({ op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: [[0, 0, 0], [40 * IN, 0, 0], [40 * IN, 10 * IN, 0], [0, 10 * IN, 0]], closed: true });
+    const made = apply({ op: "extrude", sketch: drawn.sketch, region: drawn.inside, distance: 0.75 * IN });
+    apply({ op: "make_component", items: [{ object: made.object }], name: "Shelf" });
+  });
+  await openShz(page, shz, 1, "shelf.shz");
+  await setUnits(page, "mm");
+  await page.getByRole("tab", { name: "Cut list" }).click();
+  await expect(page.locator(".cutlist table")).toBeVisible();
+  await page.getByRole("button", { name: "Nesting ›" }).click();
+  const section = page.getByTestId("nesting");
+  const body = section.locator(".nest-body");
+  const kerf = section.getByLabel("Kerf", { exact: true });
+  const away = page.getByLabel("Round sizes to");
+  await expect(kerf).toHaveValue("3.18 mm");
+  await expect(body).toHaveAttribute("aria-busy", "false");
+  const edit = () => nestEdit(page);
+  const settled = () => nestSettled(page);
+  const stored = async () => (await nest(page)).settings as Nest["settings"] & { jointLoss?: number };
+  expect((await stored()).kerf).toBe(IN / 8);
+  // Enter.
+  await edit();
+  await kerf.fill("3.18");
+  await kerf.press("Enter");
+  await settled();
+  expect((await stored()).kerf).toBeCloseTo(0.00318, 12);
+  await expect(page.locator("#hint")).toContainText("Nesting: kerf 3.18 mm");
+  await expect(kerf).toHaveValue("3.18 mm");
+  // Undo and Redo: the stored kerf changes, the reading does not.
+  await away.focus();
+  for (const [key, m] of [["Control+z", IN / 8], ["Control+y", 0.00318], ["Control+z", IN / 8]] as const) {
+    await edit();
+    await page.keyboard.press(key);
+    await settled();
+    expect((await stored()).kerf).toBeCloseTo(m, 12);
+    await expect(kerf).toHaveValue("3.18 mm");
+  }
+  // Leaving the field.
+  await edit();
+  await kerf.fill("3.18");
+  await away.focus();
+  await settled();
+  expect((await stored()).kerf).toBeCloseTo(0.00318, 12);
+  await expect(kerf).toHaveValue("3.18 mm");
+  await edit();
+  await page.keyboard.press("Control+z");
+  await settled();
+  expect((await stored()).kerf).toBeCloseTo(IN / 8, 12);
+  // The pause: stored, and what was typed stays until the field is left.
+  await edit();
+  await kerf.fill("3.18");
+  await settled();
+  expect((await stored()).kerf).toBeCloseTo(0.00318, 12);
+  await expect(kerf).toHaveValue("3.18");
+  await away.focus();
+  await expect(kerf).toHaveValue("3.18 mm");
+  // Enter on Trim, Joint loss and Minimum strip. A trim of 0 typed over 0 and a minimum
+  // strip typed over the same length change nothing, so there is no nesting to wait for.
+  const trim = section.getByLabel("Trim");
+  await trim.fill("0");
+  await trim.press("Enter");
+  await expect(trim).toHaveValue("0 mm");
+  const joint = section.getByLabel("Joint loss");
+  await edit();
+  await joint.fill("3.18");
+  await joint.press("Enter");
+  await settled();
+  expect((await stored()).jointLoss).toBeCloseTo(0.00318, 12);
+  await expect(joint).toHaveValue("3.18 mm");
+  const min = section.getByLabel("Minimum strip");
+  await edit();
+  await min.fill("38.1");
+  await min.press("Enter");
+  await settled();
+  await expect(min).toHaveValue("38.1 mm");
+  await min.fill("38.1");
+  await min.press("Enter");
+  await expect(min).toHaveValue("38.1 mm");
+  // A length that is refused stays as typed, with its reason, after Enter and after leaving
+  // the field; Escape puts the reading back.
+  await kerf.fill("abc");
+  await kerf.press("Enter");
+  await expect(kerf).toHaveValue("abc");
+  await expect(section.locator("label.err")).toHaveCount(1);
+  await away.focus();
+  await expect(kerf).toHaveValue("abc");
+  await kerf.press("Escape");
+  await expect(kerf).toHaveValue("3.18 mm");
+  await expect(section.locator("label.err")).toHaveCount(0);
+  expect((await stored()).kerf).toBeCloseTo(0.00318, 12);
+  // A length that reads differently: the field goes from what was typed to its new reading,
+  // never back to the old reading in between, by Enter or by the pause. Every frame's text
+  // is recorded, each change once.
+  const record = async () => {
+    await page.evaluate(() => {
+      const w = window as unknown as { __kerfSeen: string[]; __kerfStop?: () => void };
+      w.__kerfStop?.();
+      let on = true;
+      w.__kerfStop = () => (on = false);
+      w.__kerfSeen = [];
+      const tick = () => {
+        const v = document.querySelector<HTMLInputElement>('[aria-label="Kerf"]')?.value ?? "(none)";
+        if (w.__kerfSeen[w.__kerfSeen.length - 1] !== v) w.__kerfSeen.push(v);
+        if (on) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __kerfSeen: string[] }).__kerfSeen.length)).toBeGreaterThan(0);
+  };
+  const recorded = () => page.evaluate(() => (window as unknown as { __kerfSeen: string[] }).__kerfSeen);
+  await record();
+  await edit();
+  await kerf.fill("5");
+  await kerf.press("Enter");
+  await settled();
+  expect((await stored()).kerf).toBeCloseTo(0.005, 12);
+  await expect(kerf).toHaveValue("5 mm");
+  await expect.poll(async () => (await recorded()).at(-1)).toBe("5 mm");
+  let seen = await recorded();
+  expect(seen[0]).toBe("3.18 mm");
+  expect(seen.slice(1)).not.toContain("3.18 mm");
+  await record();
+  await edit();
+  await kerf.fill("4");
+  await settled();
+  expect((await stored()).kerf).toBeCloseTo(0.004, 12);
+  // #98: the field is still being typed in, so the new reading waits until it is left.
+  await expect(kerf).toHaveValue("4");
+  await away.focus();
+  await expect(kerf).toHaveValue("4 mm");
+  await expect.poll(async () => (await recorded()).at(-1)).toBe("4 mm");
+  seen = await recorded();
+  expect(seen).toEqual(["5 mm", "4", "4 mm"]);
+  await page.evaluate(() => (window as unknown as { __kerfStop: () => void }).__kerfStop());
+  // Fractional and decimal inches: a typed length that rounds to the reading shown. A change
+  // of units changes no setting, so it works out no nesting.
+  await away.focus();
+  await setUnits(page, "frac-in");
+  await edit();
+  await kerf.fill("1/8");
+  await kerf.press("Enter");
+  await settled();
+  await expect(kerf).toHaveValue("1/8 in");
+  await edit();
+  await kerf.fill("0.13");
+  await kerf.press("Enter");
+  await settled();
+  expect((await stored()).kerf).toBeCloseTo(0.13 * IN, 12);
+  await expect(kerf).toHaveValue("1/8 in");
+  // In decimal inches the 0.13 in it holds reads 0.13 in; 0.1301 reads the same.
+  await setUnits(page, "in");
+  await expect(kerf).toHaveValue("0.13 in");
+  await edit();
+  await kerf.fill("0.1301");
+  await kerf.press("Enter");
+  await settled();
+  expect((await stored()).kerf).toBeCloseTo(0.1301 * IN, 12);
+  await expect(kerf).toHaveValue("0.13 in");
+});
+
+// #98: text being typed in a Nesting length field stays while the reading of the stored value
+// changes. The pause: 3.1 typed in millimetres is stored after the pause and stays as typed,
+// so a 5 typed next makes 3.15, not 3.1 mm5; the same in fractional and decimal inches. A
+// late refresh: Undo sets the pane working the nesting out again, a length is typed before
+// that lands, and it stays; Enter stores it, and Escape gives it up for the reading that
+// arrived. The page's clock holds the refresh until the text is in the field, so the two never
+// race.
+test("a Nesting length field keeps the text being typed when its reading changes (#98)", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.clock.install();
+  const shz = await buildShz((apply) => {
+    const drawn = apply({ op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: [[0, 0, 0], [40 * IN, 0, 0], [40 * IN, 10 * IN, 0], [0, 10 * IN, 0]], closed: true });
+    const made = apply({ op: "extrude", sketch: drawn.sketch, region: drawn.inside, distance: 0.75 * IN });
+    apply({ op: "make_component", items: [{ object: made.object }], name: "Shelf" });
+  });
+  await openShz(page, shz, 1, "shelf.shz");
+  await setUnits(page, "mm");
+  await page.getByRole("tab", { name: "Cut list" }).click();
+  await expect(page.locator(".cutlist table")).toBeVisible();
+  await page.getByRole("button", { name: "Nesting ›" }).click();
+  const section = page.getByTestId("nesting");
+  const body = section.locator(".nest-body");
+  const kerf = section.getByLabel("Kerf", { exact: true });
+  const away = page.getByLabel("Round sizes to");
+  const stored = async () => (await nest(page)).settings as Nest["settings"] & { jointLoss?: number };
+  await expect(kerf).toHaveValue("3.18 mm");
+  await expect(body).toHaveAttribute("aria-busy", "false");
+  // A late refresh. A 2 mm kerf is set; then timers stop, Undo (from outside the field) puts
+  // the 1/8 in kerf back and sets the pane busy, and its refresh, due 200 ms later, waits for
+  // the clock.
+  await nestEdit(page);
+  await kerf.fill("2");
+  await kerf.press("Enter");
+  await nestSettled(page);
+  await expect(kerf).toHaveValue("2 mm");
+  const late = async (typed: string) => {
+    await away.focus();
+    await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1000);
+    await nestEdit(page);
+    await page.keyboard.press("Control+z");
+    await expect(body).toHaveAttribute("aria-busy", "true");
+    await kerf.fill(typed);
+    await page.clock.runFor(250);
+    await nestSettled(page);
+    // The refresh has landed: the field still holds what was typed.
+    await expect(kerf).toHaveValue(typed);
+  };
+  await late("5");
+  expect((await stored()).kerf).toBeCloseTo(IN / 8, 12);
+  await nestEdit(page);
+  await kerf.press("Enter");
+  await page.clock.resume();
+  await nestSettled(page);
+  expect((await stored()).kerf).toBeCloseTo(0.005, 12);
+  await expect(kerf).toHaveValue("5 mm");
+  // Undo again takes the 5 mm kerf back. Escape gives the typed length up for the reading
+  // that arrived; nothing is stored.
+  await late("7");
+  expect((await stored()).kerf).toBeCloseTo(IN / 8, 12);
+  await kerf.press("Escape");
+  await expect(kerf).toHaveValue("3.18 mm");
+  // Past the pause: nothing left to store.
+  await page.clock.runFor(1000);
+  await page.clock.resume();
+  expect((await stored()).kerf).toBeCloseTo(IN / 8, 12);
+  await expect(kerf).toHaveValue("3.18 mm");
+  // The pause, in each kind of units: stored, the typed text left as it is, the next keys
+  // added to it, and Enter storing the whole and showing it with its unit.
+  const pause = async (label: string, first: string, more: string, metres: number, reads: string) => {
+    const field = section.getByLabel(label, { exact: true });
+    await nestEdit(page);
+    await field.fill(first);
+    await nestSettled(page);
+    await expect(field).toHaveValue(first);
+    await field.press("End");
+    await field.pressSequentially(more);
+    await expect(field).toHaveValue(first + more);
+    await nestEdit(page);
+    await field.press("Enter");
+    await nestSettled(page);
+    const key = { Kerf: "kerf", Trim: "trim", "Joint loss": "jointLoss", "Minimum strip": "minStrip" }[label] as "kerf";
+    expect((await stored())[key], label).toBeCloseTo(metres, 12);
+    await expect(field).toHaveValue(reads);
+    await expect(section.locator("label.err")).toHaveCount(0);
+  };
+  await pause("Kerf", "3.1", "5", 0.00315, "3.15 mm");
+  await setUnits(page, "frac-in");
+  await pause("Minimum strip", "1", " 1/2", 1.5 * IN, "1 1/2 in");
+  await setUnits(page, "in");
+  await pause("Trim", "0.5", "5", 0.55 * IN, "0.55 in");
+});
+
+// #100: a Nesting setting changed right after Undo or Redo, before the pane has worked the
+// nesting out again, is laid over the settings stored now, and a typed length is compared with
+// the stored one, not the pane's last nesting. The page's clock holds the refresh (as for #98),
+// so each step lands inside the 200 ms the pane takes, every time.
+test("a Nesting setting changed right after Undo or Redo keeps what Undo or Redo did (#100)", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.clock.install();
+  const shz = await buildShz((apply) => {
+    const drawn = apply({ op: "draw", target: { on: "plane", origin: [0, 0, 0], normal: [0, 0, 1] }, points: [[0, 0, 0], [40 * IN, 0, 0], [40 * IN, 10 * IN, 0], [0, 10 * IN, 0]], closed: true });
+    const made = apply({ op: "extrude", sketch: drawn.sketch, region: drawn.inside, distance: 0.75 * IN });
+    apply({ op: "make_component", items: [{ object: made.object }], name: "Shelf" });
+  });
+  await openShz(page, shz, 1, "shelf.shz");
+  await setUnits(page, "mm");
+  await page.getByRole("tab", { name: "Cut list" }).click();
+  await expect(page.locator(".cutlist table")).toBeVisible();
+  await page.getByRole("button", { name: "Nesting ›" }).click();
+  const section = page.getByTestId("nesting");
+  const body = section.locator(".nest-body");
+  const kerf = section.getByLabel("Kerf", { exact: true });
+  const trim = section.getByLabel("Trim", { exact: true });
+  const away = page.getByLabel("Round sizes to");
+  const stored = async () => (await nest(page)).settings;
+  await expect(kerf).toHaveValue("3.18 mm");
+  await expect(body).toHaveAttribute("aria-busy", "false");
+  const enter = async (field: typeof kerf, text: string) => {
+    await nestEdit(page);
+    await field.fill(text);
+    await field.press("Enter");
+    await nestSettled(page);
+  };
+  // Undo or Redo from outside the fields, the pane's refresh held by the clock; then `then`
+  // runs before the refresh, and the clock lets it go.
+  const beforeRefresh = async (key: string, then: () => Promise<void>) => {
+    await away.focus();
+    await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1000);
+    await nestEdit(page);
+    await page.keyboard.press(key);
+    await expect(body).toHaveAttribute("aria-busy", "true");
+    await then();
+    await page.clock.resume();
+    await nestSettled(page);
+  };
+  // 1. Another field's Undo is kept. Kerf and trim 3.1 mm; Undo puts trim back to 0; kerf
+  // 3.15 typed before the refresh stores kerf 3.15 mm and leaves trim at 0.
+  const near = async (want: { kerf: number; trim: number; algorithm?: string }) => {
+    const s = await stored();
+    expect(s.kerf, "kerf").toBeCloseTo(want.kerf, 12);
+    expect(s.trim, "trim").toBeCloseTo(want.trim, 12);
+    if (want.algorithm) expect(s.algorithm).toBe(want.algorithm);
+  };
+  await enter(kerf, "3.1");
+  await enter(trim, "3.1");
+  await near({ kerf: 0.0031, trim: 0.0031 });
+  await beforeRefresh("Control+z", async () => {
+    await kerf.fill("3.15");
+    await kerf.press("Enter");
+  });
+  await near({ kerf: 0.00315, trim: 0 });
+  await expect(kerf).toHaveValue("3.15 mm");
+  await expect(trim).toHaveValue("0 mm");
+  // 2. Enter after Undo stores the length typed. Undo takes the 3.15 back to 3.1 mm, and Undo
+  // again takes kerf back to 1/8 in; 3.1 typed and Enter, before the refresh, stores 3.1 mm.
+  await nestEdit(page);
+  await away.focus();
+  await page.keyboard.press("Control+z");
+  await nestSettled(page);
+  await expect(kerf).toHaveValue("3.1 mm");
+  await beforeRefresh("Control+z", async () => {
+    await kerf.fill("3.1");
+    await kerf.press("Enter");
+  });
+  await near({ kerf: 0.0031, trim: 0 });
+  await expect(kerf).toHaveValue("3.1 mm");
+  // 3. After Redo too. Trim 3.1 mm, then Undo; Redo puts it back, and the saw switched before
+  // the refresh keeps it.
+  await enter(trim, "3.1");
+  await nestEdit(page);
+  await away.focus();
+  await page.keyboard.press("Control+z");
+  await nestSettled(page);
+  await expect(trim).toHaveValue("0 mm");
+  await beforeRefresh("Control+y", async () => {
+    await section.getByLabel("Nesting algorithm").selectOption("maxrects");
+  });
+  await near({ kerf: 0.0031, trim: 0.0031, algorithm: "maxrects" });
 });

@@ -1,10 +1,12 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { smallNesting } from "../nesting/fixture";
+import { gluedNesting, smallNesting } from "../nesting/fixture";
 import { NestingSection, type NestingSectionProps } from "./NestingSection";
 import { StockDialog, type StockDialogProps } from "./StockDialog";
 import { CutListPane, type CutListPaneProps } from "./CutListPane";
 import { bookshelf } from "../cutlist/fixture";
+import { parseLength } from "../lib/units";
+import { fineU } from "../nesting/format";
 
 afterEach(cleanup);
 
@@ -97,6 +99,690 @@ describe("Nesting section", () => {
     fireEvent.keyDown(joint, { key: "Enter" });
     expect(p.onSettings).toHaveBeenCalledTimes(1);
     expect(joint.closest("label")!.getAttribute("title")).toContain("0 to 1/2 in");
+  });
+
+  it("#57: the minimum strip is empty (auto) until set, takes a typed length, 0 to 12 in, and clears back to auto", () => {
+    const p = props();
+    const { rerender } = render(<NestingSection {...p} />);
+    const min = screen.getByLabelText("Minimum strip") as HTMLInputElement;
+    // Absent from the document's settings: empty, the #56 rule.
+    expect(min.value).toBe("");
+    expect(min.placeholder).toBe("auto");
+    expect(min.closest("label")!.getAttribute("title")).toContain("1 1/2 in, or a quarter of the board");
+    fireEvent.change(min, { target: { value: "2" } });
+    fireEvent.keyDown(min, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: IN / 8, trim: 0, algorithm: "guillotine", minStrip: 2 * IN });
+    // Out of range: refused, nothing sent.
+    fireEvent.change(min, { target: { value: "13" } });
+    fireEvent.keyDown(min, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenCalledTimes(1);
+    expect(min.closest("label")!.getAttribute("title")).toContain("0 to 12 in");
+    // Set in the document: shown; cleared: the setting goes, not a 0.
+    const n = smallNesting();
+    n.settings = { ...n.settings, minStrip: 2 * IN };
+    rerender(<NestingSection {...p} nesting={n} />);
+    expect(min.value).toBe("2 in");
+    fireEvent.change(min, { target: { value: "" } });
+    fireEvent.keyDown(min, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenCalledTimes(2);
+    const last = (p.onSettings as unknown as { mock: { calls: [Record<string, unknown>][] } }).mock.calls[1][0];
+    expect(last).toEqual({ kerf: IN / 8, trim: 0, algorithm: "guillotine" });
+    expect("minStrip" in last).toBe(false);
+    // 0 is a value (never even out), not auto.
+    fireEvent.change(min, { target: { value: "0" } });
+    fireEvent.keyDown(min, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: IN / 8, trim: 0, algorithm: "guillotine", minStrip: 0 });
+  });
+
+  it("#57: a pause on an emptied Minimum strip field clears nothing; Enter or leaving the field does", () => {
+    vi.useFakeTimers();
+    try {
+      const n = smallNesting();
+      n.settings = { ...n.settings, minStrip: 2 * IN };
+      const p = props({ nesting: n });
+      render(<NestingSection {...p} />);
+      const min = screen.getByLabelText("Minimum strip") as HTMLInputElement;
+      // Backspaced to empty on the way to typing another length: the pause sends nothing.
+      fireEvent.change(min, { target: { value: "" } });
+      act(() => vi.advanceTimersByTime(2000));
+      expect(p.onSettings).not.toHaveBeenCalled();
+      // A length typed then pauses commit as before.
+      fireEvent.change(min, { target: { value: "3" } });
+      act(() => vi.advanceTimersByTime(800));
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: IN / 8, trim: 0, algorithm: "guillotine", minStrip: 3 * IN });
+      // Emptied and left: cleared.
+      fireEvent.change(min, { target: { value: "" } });
+      fireEvent.blur(min);
+      expect(p.onSettings).toHaveBeenCalledTimes(2);
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: IN / 8, trim: 0, algorithm: "guillotine" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("#57: the minimum strip reads millimetres in a metric document and takes 12 in written any way", () => {
+    const n = smallNesting();
+    n.settings = { ...n.settings, minStrip: 0.038 };
+    const p = props({ nesting: n, units: "mm", rounding: "half_mm" });
+    render(<NestingSection {...p} />);
+    const min = screen.getByLabelText("Minimum strip") as HTMLInputElement;
+    expect(min.value).toBe("38 mm");
+    // 12 in exactly, as 304.8 mm, 1 ft and 12 in: each taken, none refused as past 12 in.
+    for (const [typed, m] of [["304.8", 0.3048], ["1'", 0.3048], ["12in", 12 * IN]] as const) {
+      fireEvent.change(min, { target: { value: typed } });
+      fireEvent.keyDown(min, { key: "Enter" });
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: IN / 8, trim: 0, algorithm: "guillotine", minStrip: m });
+    }
+    expect(p.onSettings).toHaveBeenCalledTimes(3);
+    fireEvent.change(min, { target: { value: "304.9" } });
+    fireEvent.keyDown(min, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenCalledTimes(3);
+    expect(min.closest("label")!.getAttribute("title")).toContain("0 to 304.8 mm");
+  });
+
+  it("#57 (lane 56): the minimum strip's top is exactly 0.3048 m, the float above it refused", () => {
+    // The neighbouring doubles of 0.3048, by their bits.
+    const step = (x: number, by: 1n | -1n) => {
+      const b = new BigInt64Array(new Float64Array([x]).buffer);
+      b[0] += by;
+      return new Float64Array(b.buffer)[0];
+    };
+    const above = step(0.3048, 1n);
+    const below = step(0.3048, -1n);
+    // Typed in metres, each reads as exactly that double.
+    const typed = (m: number) => `${m} m`;
+    for (const m of [0.3048, above, below]) {
+      const r = parseLength(typed(m), "frac-in");
+      expect(r.ok && r.metres === m).toBe(true);
+    }
+    expect(above).toBe(0.30480000000000007);
+    const p = props();
+    render(<NestingSection {...p} />);
+    const min = screen.getByLabelText("Minimum strip") as HTMLInputElement;
+    // 0.3048 m and the double under it are taken (a top moved one step down refuses 0.3048).
+    for (const m of [0.3048, below]) {
+      fireEvent.change(min, { target: { value: typed(m) } });
+      fireEvent.keyDown(min, { key: "Enter" });
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: IN / 8, trim: 0, algorithm: "guillotine", minStrip: m });
+    }
+    expect(p.onSettings).toHaveBeenCalledTimes(2);
+    // The double above it is refused (a top moved one step up takes it), and nothing is sent.
+    fireEvent.change(min, { target: { value: typed(above) } });
+    fireEvent.keyDown(min, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenCalledTimes(2);
+    expect(min.closest("label")!.getAttribute("title")).toContain("Minimum strip: 0 to 12 in.");
+  });
+
+  it("#57 (lane 56): a minimum strip set to 0 shows 0 in the document's units, not auto", () => {
+    for (const [units, rounding, shown] of [
+      ["frac-in", "sixteenth", "0 in"],
+      ["mm", "half_mm", "0 mm"],
+    ] as const) {
+      const n = smallNesting();
+      n.settings = { ...n.settings, minStrip: 0 };
+      const p = props({ nesting: n, units, rounding });
+      render(<NestingSection {...p} />);
+      const min = screen.getByLabelText("Minimum strip") as HTMLInputElement;
+      expect(min.value).toBe(shown);
+      // Shown as set, Enter on it sends nothing; emptied, it clears back to auto.
+      fireEvent.keyDown(min, { key: "Enter" });
+      expect(p.onSettings).not.toHaveBeenCalled();
+      fireEvent.change(min, { target: { value: "" } });
+      fireEvent.keyDown(min, { key: "Enter" });
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: IN / 8, trim: 0, algorithm: "guillotine" });
+      cleanup();
+    }
+  });
+
+  it("#89: the 1/8 in kerf and joint loss read 3.18 mm, and Enter on them or leaving them keeps exactly 1/8 in", () => {
+    const p = props({ units: "mm", rounding: "half_mm" });
+    render(<NestingSection {...p} />);
+    for (const label of ["Kerf", "Joint loss"]) {
+      const f = screen.getByLabelText(label) as HTMLInputElement;
+      expect(f.value).toBe("3.18 mm");
+      fireEvent.keyDown(f, { key: "Enter" });
+      fireEvent.blur(f);
+    }
+    // 3.18 mm read back would be 0.005 mm wider than the 1/8 in the document holds.
+    expect(p.onSettings).not.toHaveBeenCalled();
+  });
+
+  it("#92: Enter and blur keep the exact kerf when the decimal display rounds up", () => {
+    const nesting = smallNesting();
+    nesting.settings.kerf = (3 / 16) * IN;
+    const p = props({ nesting, units: "in", rounding: { r: "sixteenth", style: "decimal" } });
+    render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    expect(kerf.value).toBe("0.188 in");
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    fireEvent.blur(kerf);
+    expect(p.onSettings).not.toHaveBeenCalled();
+  });
+
+  it("#92: a kerf and joint loss reading 1/32 in or 0.188 in keep their exact length on Enter or leaving the field", () => {
+    for (const [units, rounding, length, shown] of [
+      ["frac-in", "sixteenth", (3 / 128) * IN, "1/32 in"],
+      ["in", { r: "sixteenth", style: "decimal" }, (3 / 16) * IN, "0.188 in"],
+    ] as const) {
+      const n = smallNesting();
+      n.settings = { ...n.settings, kerf: length, jointLoss: length };
+      const p = props({ nesting: n, units, rounding });
+      render(<NestingSection {...p} />);
+      for (const label of ["Kerf", "Joint loss"]) {
+        const f = screen.getByLabelText(label) as HTMLInputElement;
+        expect(f.value).toBe(shown);
+        fireEvent.keyDown(f, { key: "Enter" });
+        fireEvent.blur(f);
+      }
+      // Read back, 1/32 in is 1/128 in wider and 0.188 in 0.0005 in wider than what is held.
+      expect(p.onSettings).not.toHaveBeenCalled();
+      cleanup();
+    }
+  });
+
+  it("#101: a new reading clears a refused length's error, but unchanged text keeps it", () => {
+    const n = smallNesting();
+    n.settings = { ...n.settings, kerf: 0.00318 };
+    const p = props({ nesting: n, units: "mm", rounding: "half_mm" });
+    const { rerender } = render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+
+    fireEvent.change(kerf, { target: { value: "999" } });
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    expect(kerf.closest("label")!.getAttribute("title")).toContain("Kerf: 0 to");
+
+    // A rerender with the same reading does not replace the refused text, so the mark stays.
+    rerender(<NestingSection {...p} nesting={n} />);
+    expect(kerf.closest("label")!.getAttribute("title")).toContain("Kerf: 0 to");
+
+    // Leaving the field ends typing; a later Undo/Redo reading replaces the refused text.
+    fireEvent.blur(kerf);
+    const redone = smallNesting();
+    redone.settings = { ...redone.settings, kerf: 0.0031 };
+    rerender(<NestingSection {...p} nesting={redone} />);
+    expect(kerf.value).toBe("3.1 mm");
+    expect(kerf.closest("label")!.className).toBe("");
+    expect(kerf.closest("label")!.getAttribute("title")).not.toContain("Kerf: 0 to");
+  });
+
+  it("#93: a committed field that reads the same still gets its unit back", () => {
+    // A typed value that rounds to the text already shown leaves the raw text in the box:
+    // the `shown` string does not change, so the effect that resets it never runs. #93.
+    // Millimetres: the built-in 1/8 in (3.175 mm) reads "3.18 mm"; typing 3.18 reads the
+    // same, so the committed value must still be shown with its unit.
+    {
+      const p = props({ units: "mm", rounding: "half_mm" });
+      render(<NestingSection {...p} />);
+      const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+      expect(kerf.value).toBe("3.18 mm");
+      fireEvent.change(kerf, { target: { value: "3.18" } });
+      fireEvent.keyDown(kerf, { key: "Enter" });
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: 0.00318, trim: 0, algorithm: "guillotine" });
+      expect(kerf.value).toBe("3.18 mm");
+      cleanup();
+    }
+    // Fractional inches: typing 0.13 in rounds to 1/8 in, the text already shown.
+    {
+      const p = props();
+      render(<NestingSection {...p} />);
+      const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+      expect(kerf.value).toBe("1/8 in");
+      fireEvent.change(kerf, { target: { value: "0.13" } });
+      fireEvent.keyDown(kerf, { key: "Enter" });
+      expect(kerf.value).toBe("1/8 in");
+      cleanup();
+    }
+  });
+
+  // #93, more cases: the settings as the app holds them after a commit, Undo or Redo.
+  const at93 = (s: Partial<ReturnType<typeof smallNesting>["settings"]>) => {
+    const n = smallNesting();
+    return { ...n, settings: { ...n.settings, ...s } };
+  };
+
+  it("#93: leaving the field commits a length that reads the same, and Undo and Redo keep the unit", () => {
+    const p = props({ units: "mm", rounding: "half_mm" });
+    const { rerender } = render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    fireEvent.change(kerf, { target: { value: "3.18" } });
+    fireEvent.blur(kerf);
+    expect(p.onSettings).toHaveBeenCalledTimes(1);
+    expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: 0.00318, trim: 0, algorithm: "guillotine" });
+    expect(kerf.value).toBe("3.18 mm");
+    // The app applies it; then Undo (back to 1/8 in) and Redo: the reading never changes.
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.00318 })} />);
+    expect(kerf.value).toBe("3.18 mm");
+    rerender(<NestingSection {...p} nesting={at93({})} />);
+    expect(kerf.value).toBe("3.18 mm");
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.00318 })} />);
+    expect(kerf.value).toBe("3.18 mm");
+    // Enter and leaving the field again commit nothing more.
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    fireEvent.blur(kerf);
+    expect(p.onSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("#93: Trim, Joint loss and Minimum strip get their unit back too, and so do decimal inches", () => {
+    {
+      const p = props({ units: "mm", rounding: "half_mm", nesting: at93({ minStrip: 0.0381 }) });
+      render(<NestingSection {...p} />);
+      const trim = screen.getByLabelText("Trim") as HTMLInputElement;
+      expect(trim.value).toBe("0 mm");
+      fireEvent.change(trim, { target: { value: "0" } });
+      fireEvent.keyDown(trim, { key: "Enter" });
+      expect(trim.value).toBe("0 mm");
+      expect(p.onSettings).not.toHaveBeenCalled();
+      const loss = screen.getByLabelText("Joint loss") as HTMLInputElement;
+      fireEvent.change(loss, { target: { value: "3.18" } });
+      fireEvent.keyDown(loss, { key: "Enter" });
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: IN / 8, trim: 0, jointLoss: 0.00318, minStrip: 0.0381, algorithm: "guillotine" });
+      expect(loss.value).toBe("3.18 mm");
+      const min = screen.getByLabelText("Minimum strip") as HTMLInputElement;
+      expect(min.value).toBe("38.1 mm");
+      fireEvent.change(min, { target: { value: "38.1" } });
+      fireEvent.keyDown(min, { key: "Enter" });
+      expect(min.value).toBe("38.1 mm");
+      cleanup();
+    }
+    {
+      const p = props({ units: "in", rounding: { r: "sixteenth", style: "decimal" } });
+      render(<NestingSection {...p} />);
+      const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+      expect(kerf.value).toBe("0.125 in");
+      fireEvent.change(kerf, { target: { value: "0.1251" } });
+      fireEvent.keyDown(kerf, { key: "Enter" });
+      expect(p.onSettings).toHaveBeenCalledTimes(1);
+      expect(kerf.value).toBe("0.125 in");
+      cleanup();
+    }
+  });
+
+  it("#93: the pause commits a length that reads the same but leaves the typed text until Enter or leaving the field", () => {
+    vi.useFakeTimers();
+    try {
+      const p = props({ units: "mm", rounding: "half_mm" });
+      const { rerender } = render(<NestingSection {...p} />);
+      const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+      fireEvent.change(kerf, { target: { value: "3.18" } });
+      vi.advanceTimersByTime(800);
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: 0.00318, trim: 0, algorithm: "guillotine" });
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.00318 })} />);
+      // Still what was typed: the person may be going on to type 3.185.
+      expect(kerf.value).toBe("3.18");
+      fireEvent.blur(kerf);
+      expect(kerf.value).toBe("3.18 mm");
+      expect(p.onSettings).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("#93: a length that reads differently keeps the typed text until the new value arrives, then reads it", () => {
+    vi.useFakeTimers();
+    try {
+      const p = props({ units: "mm", rounding: "half_mm" });
+      const { rerender } = render(<NestingSection {...p} />);
+      const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+      fireEvent.change(kerf, { target: { value: "5" } });
+      fireEvent.keyDown(kerf, { key: "Enter" });
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: 0.005, trim: 0, algorithm: "guillotine" });
+      // Not the old 3.18 mm while the app works it out.
+      expect(kerf.value).toBe("5");
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.005 })} />);
+      expect(kerf.value).toBe("5 mm");
+      // The same by the pause.
+      fireEvent.change(kerf, { target: { value: "4" } });
+      vi.advanceTimersByTime(800);
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: 0.004, trim: 0, algorithm: "guillotine" });
+      expect(kerf.value).toBe("4");
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.004 })} />);
+      expect(kerf.value).toBe("4 mm");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("#93: a length that is refused stays as typed, with the reason", () => {
+    const p = props({ units: "mm", rounding: "half_mm" });
+    render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    for (const typed of ["abc", "2 in"]) {
+      fireEvent.change(kerf, { target: { value: typed } });
+      fireEvent.keyDown(kerf, { key: "Enter" });
+      expect(kerf.value).toBe(typed);
+      expect(kerf.closest("label")!.className).toBe("err");
+      fireEvent.blur(kerf);
+      expect(kerf.value).toBe(typed);
+    }
+    expect(p.onSettings).not.toHaveBeenCalled();
+  });
+
+  it("#93: a stored kerf over the field's top, typed as it reads, is refused and stays as typed", () => {
+    // A file can hold a kerf the field would refuse: 0.6 in, over the 1/2 in top.
+    const p = props({ units: "mm", rounding: "half_mm", nesting: at93({ kerf: 0.6 * IN }) });
+    render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    expect(kerf.value).toBe("15.24 mm");
+    fireEvent.change(kerf, { target: { value: "15.24" } });
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    expect(kerf.value).toBe("15.24");
+    expect(kerf.closest("label")!.className).toBe("err");
+    expect(kerf.closest("label")!.title).toBe("Kerf: 0 to 12.7 mm.");
+    expect(p.onSettings).not.toHaveBeenCalled();
+  });
+
+  // #98: text typed into a focused length field is not replaced when the reading of the
+  // stored value changes meanwhile; the new reading waits for Enter, leaving or Escape.
+  it("#98: the pause stores what was typed, and the next keys land in the typed text", () => {
+    vi.useFakeTimers();
+    try {
+      const p = props({ units: "mm", rounding: "half_mm" });
+      const { rerender } = render(<NestingSection {...p} />);
+      const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+      act(() => kerf.focus());
+      fireEvent.change(kerf, { target: { value: "3.1" } });
+      act(() => void vi.advanceTimersByTime(800));
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: 3.1 * 0.001, trim: 0, algorithm: "guillotine" });
+      // The app applies the pause's length; the field is still being typed in.
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.0031 })} />);
+      expect(kerf.value).toBe("3.1");
+      fireEvent.change(kerf, { target: { value: "3.15" } });
+      expect(kerf.value).toBe("3.15");
+      fireEvent.keyDown(kerf, { key: "Enter" });
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: 3.15 * 0.001, trim: 0, algorithm: "guillotine" });
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.00315 })} />);
+      expect(kerf.value).toBe("3.15 mm");
+      expect(kerf.closest("label")!.className).toBe("");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("#98: a late refresh that changes the reading leaves the typed text, and Enter stores it", () => {
+    vi.useFakeTimers();
+    try {
+      const p = props({ units: "mm", rounding: "half_mm" });
+      const { rerender } = render(<NestingSection {...p} />);
+      const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+      act(() => kerf.focus());
+      fireEvent.change(kerf, { target: { value: "5" } });
+      // Undo from elsewhere lands before the pause: the stored kerf now reads 2 mm.
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.002 })} />);
+      expect(kerf.value).toBe("5");
+      fireEvent.keyDown(kerf, { key: "Enter" });
+      expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: 0.005, trim: 0, algorithm: "guillotine" });
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.005 })} />);
+      expect(kerf.value).toBe("5 mm");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("#98: the new reading shows after leaving the field or Escape", () => {
+    const p = props({ units: "mm", rounding: "half_mm" });
+    const { rerender } = render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    // Leaving: a reading that changed meanwhile is shown once the typed one is committed.
+    act(() => kerf.focus());
+    fireEvent.change(kerf, { target: { value: "5" } });
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.002 })} />);
+    expect(kerf.value).toBe("5");
+    fireEvent.blur(kerf);
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.005 })} />);
+    expect(kerf.value).toBe("5 mm");
+    // Escape gives the typed text up for the reading now stored.
+    act(() => kerf.focus());
+    fireEvent.change(kerf, { target: { value: "7" } });
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.002 })} />);
+    expect(kerf.value).toBe("7");
+    fireEvent.keyDown(kerf, { key: "Escape" });
+    expect(kerf.value).toBe("2 mm");
+  });
+
+  it("#98: all four length fields keep the typed text through a late refresh, and Enter stores it", () => {
+    for (const [label, key] of [["Kerf", "kerf"], ["Trim", "trim"], ["Joint loss", "jointLoss"], ["Minimum strip", "minStrip"]] as const) {
+      const p = props({ units: "mm", rounding: "half_mm" });
+      const { rerender } = render(<NestingSection {...p} />);
+      const field = screen.getByLabelText(label, { exact: true }) as HTMLInputElement;
+      act(() => field.focus());
+      fireEvent.change(field, { target: { value: "5" } });
+      rerender(<NestingSection {...p} nesting={at93({ [key]: 0.002 })} />);
+      expect(field.value, label).toBe("5");
+      fireEvent.keyDown(field, { key: "Enter" });
+      expect(p.onSettings, label).toHaveBeenLastCalledWith(expect.objectContaining({ [key]: 0.005 }));
+      rerender(<NestingSection {...p} nesting={at93({ [key]: 0.005 })} />);
+      expect(field.value, label).toBe("5 mm");
+      cleanup();
+    }
+  });
+
+  it("#98: a focused field with nothing typed, or typed back to its reading, follows a new reading", () => {
+    const p = props({ units: "mm", rounding: "half_mm" });
+    const { rerender } = render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    const was = kerf.value;
+    // Focus alone is not typing.
+    act(() => kerf.focus());
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.002 })} />);
+    expect(kerf.value).toBe("2 mm");
+    // A key and then back to the reading shown: nothing of the person's to keep.
+    fireEvent.change(kerf, { target: { value: "2 mm5" } });
+    fireEvent.change(kerf, { target: { value: "2 mm" } });
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.003 })} />);
+    expect(kerf.value).toBe("3 mm");
+    // And the field goes on following the stored value.
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.00318 })} />);
+    expect(kerf.value).toBe(was);
+    expect(p.onSettings).not.toHaveBeenCalled();
+  });
+
+  it("#98: a refused length stays as typed when a new reading arrives; Escape then shows that reading", () => {
+    const p = props({ units: "mm", rounding: "half_mm" });
+    const { rerender } = render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    act(() => kerf.focus());
+    fireEvent.change(kerf, { target: { value: "abc" } });
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    expect(kerf.closest("label")!.className).toBe("err");
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.002 })} />);
+    expect(kerf.value).toBe("abc");
+    expect(kerf.closest("label")!.className).toBe("err");
+    fireEvent.keyDown(kerf, { key: "Escape" });
+    expect(kerf.value).toBe("2 mm");
+    expect(kerf.closest("label")!.className).toBe("");
+    // Refused and then left: the person is done with it, and a new reading replaces it.
+    act(() => kerf.focus());
+    fireEvent.change(kerf, { target: { value: "abc" } });
+    fireEvent.blur(kerf);
+    expect(kerf.value).toBe("abc");
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.003 })} />);
+    expect(kerf.value).toBe("3 mm");
+    expect(p.onSettings).not.toHaveBeenCalled();
+  });
+
+  it("#98: after the pause, a reading from elsewhere is shown on Escape, and nothing is stored again", () => {
+    vi.useFakeTimers();
+    try {
+      const p = props({ units: "mm", rounding: "half_mm" });
+      const { rerender } = render(<NestingSection {...p} />);
+      const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+      act(() => kerf.focus());
+      fireEvent.change(kerf, { target: { value: "3.1" } });
+      act(() => void vi.advanceTimersByTime(800));
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.0031 })} />);
+      // A plugin sets the kerf while the field still holds the typed 3.1.
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.002 })} />);
+      expect(kerf.value).toBe("3.1");
+      act(() => void vi.advanceTimersByTime(2000));
+      fireEvent.keyDown(kerf, { key: "Escape" });
+      expect(kerf.value).toBe("2 mm");
+      expect(p.onSettings).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("#98: typing again before its own commit's refresh keeps the new text", () => {
+    const p = props({ units: "mm", rounding: "half_mm" });
+    const { rerender } = render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    act(() => kerf.focus());
+    fireEvent.change(kerf, { target: { value: "5" } });
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    fireEvent.change(kerf, { target: { value: "6" } });
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.005 })} />);
+    expect(kerf.value).toBe("6");
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: 0.006, trim: 0, algorithm: "guillotine" });
+    rerender(<NestingSection {...p} nesting={at93({ kerf: 0.006 })} />);
+    expect(kerf.value).toBe("6 mm");
+  });
+
+  it("#98: a field that lost focus without a blur event follows a new reading", () => {
+    const p = props({ units: "mm", rounding: "half_mm" });
+    const { rerender } = render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    act(() => kerf.focus());
+    fireEvent.change(kerf, { target: { value: "5" } });
+    // Focus went elsewhere and no blur reached the field (say it was hidden or moved).
+    const gone = vi.spyOn(document, "activeElement", "get").mockReturnValue(document.body);
+    try {
+      rerender(<NestingSection {...p} nesting={at93({ kerf: 0.002 })} />);
+      expect(kerf.value).toBe("2 mm");
+    } finally {
+      gone.mockRestore();
+    }
+    expect(p.onSettings).not.toHaveBeenCalled();
+  });
+
+  // #101: a refused length keeps its mark and its reason while it is the field's text, and
+  // both go when a new reading replaces that text.
+  const FIELDS101 = [
+    ["Kerf", "kerf", IN / 16],
+    ["Trim", "trim", IN / 16],
+    ["Joint loss", "jointLoss", IN / 16],
+    ["Minimum strip", "minStrip", IN],
+  ] as const;
+  const UNITS101 = [
+    ["mm", "half_mm"],
+    ["frac-in", "sixteenth"],
+    ["in", { r: "sixteenth", style: "decimal" }],
+  ] as const;
+  const tip = (f: HTMLInputElement) => f.closest("label")!.getAttribute("title")!;
+  const marked = (f: HTMLInputElement) => f.closest("label")!.className;
+  const TIP = /\(type a length: 1\/8, 3\/32, 3mm\)$/;
+
+  it("#101: a refused length that was left gives way to a new reading with no mark or reason, in every field and unit", () => {
+    for (const [units, rounding] of UNITS101) {
+      for (const [label, key, m] of FIELDS101) {
+        for (const typed of ["abc", "999"]) {
+          const p = props({ units, rounding });
+          const { rerender } = render(<NestingSection {...p} />);
+          const field = screen.getByLabelText(label, { exact: true }) as HTMLInputElement;
+          const at = `${label}, ${units}, ${typed}`;
+          act(() => field.focus());
+          fireEvent.change(field, { target: { value: typed } });
+          fireEvent.keyDown(field, { key: "Enter" });
+          expect(marked(field), at).toBe("err");
+          const reason = tip(field);
+          expect(reason, at).not.toMatch(TIP);
+          fireEvent.blur(field);
+          expect(field.value, at).toBe(typed);
+          expect(tip(field), at).toBe(reason);
+          // Redo from elsewhere: the new reading replaces the text, and the mark goes with it.
+          rerender(<NestingSection {...p} nesting={at93({ [key]: m })} />);
+          expect(field.value, at).toBe(fineU(m, rounding));
+          expect(marked(field), at).toBe("");
+          expect(tip(field), at).toMatch(TIP);
+          expect(p.onSettings, at).not.toHaveBeenCalled();
+          cleanup();
+        }
+      }
+    }
+  });
+
+  it("#101: a refused length still in the focused field keeps its mark and reason through a new reading", () => {
+    vi.useFakeTimers();
+    try {
+      for (const [label, key, m] of FIELDS101) {
+        const p = props({ units: "mm", rounding: "half_mm" });
+        const { rerender } = render(<NestingSection {...p} />);
+        const field = screen.getByLabelText(label, { exact: true }) as HTMLInputElement;
+        act(() => field.focus());
+        // Refused by Enter, then by the pause.
+        for (const commit of ["Enter", "pause"]) {
+          fireEvent.change(field, { target: { value: commit === "Enter" ? "999" : "abc" } });
+          if (commit === "Enter") fireEvent.keyDown(field, { key: "Enter" });
+          else act(() => void vi.advanceTimersByTime(800));
+          const typed = field.value;
+          expect(marked(field), label).toBe("err");
+          const reason = tip(field);
+          rerender(<NestingSection {...p} nesting={at93({ [key]: commit === "Enter" ? m : 2 * m })} />);
+          expect(field.value, label).toBe(typed);
+          expect(marked(field), label).toBe("err");
+          expect(tip(field), label).toBe(reason);
+          // Nothing comes back later to clear or set it again.
+          act(() => void vi.advanceTimersByTime(2000));
+          expect(marked(field), label).toBe("err");
+          expect(tip(field), label).toBe(reason);
+        }
+        // Escape gives it up for the reading stored now.
+        fireEvent.keyDown(field, { key: "Escape" });
+        expect(field.value, label).toBe(fineU(2 * m, "half_mm"));
+        expect(marked(field), label).toBe("");
+        expect(p.onSettings, label).not.toHaveBeenCalled();
+        cleanup();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("#101: a change of units keeps a refused length being typed, and replaces one that was left", () => {
+    const p = props({ units: "mm", rounding: "half_mm" });
+    const { rerender } = render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    act(() => kerf.focus());
+    fireEvent.change(kerf, { target: { value: "999" } });
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    const reason = tip(kerf);
+    expect(reason).toBe("Kerf: 0 to 12.7 mm.");
+    // Fractions chosen while the field is still being typed in: the text and its reason stay.
+    rerender(<NestingSection {...p} units="frac-in" rounding="sixteenth" />);
+    expect(kerf.value).toBe("999");
+    expect(marked(kerf)).toBe("err");
+    expect(tip(kerf)).toBe(reason);
+    // Left, then decimal inches: the reading in the new units, no mark.
+    fireEvent.blur(kerf);
+    expect(marked(kerf)).toBe("err");
+    rerender(<NestingSection {...p} units="in" rounding={{ r: "sixteenth", style: "decimal" }} />);
+    expect(kerf.value).toBe("0.125 in");
+    expect(marked(kerf)).toBe("");
+    expect(tip(kerf)).toMatch(TIP);
+    expect(p.onSettings).not.toHaveBeenCalled();
+  });
+
+  it("#101: a refused Minimum strip that was left gives way to auto, and a rerender with the same reading keeps the mark", () => {
+    const p = props({ units: "mm", rounding: "half_mm", nesting: at93({ minStrip: 0.03 }) });
+    const { rerender } = render(<NestingSection {...p} />);
+    const min = screen.getByLabelText("Minimum strip") as HTMLInputElement;
+    expect(min.value).toBe("30 mm");
+    act(() => min.focus());
+    fireEvent.change(min, { target: { value: "1 m" } });
+    fireEvent.blur(min);
+    expect(marked(min)).toBe("err");
+    const reason = tip(min);
+    // The same reading again (the pane worked out the same settings): the refused text and
+    // its mark stay.
+    rerender(<NestingSection {...p} nesting={at93({ minStrip: 0.03 })} />);
+    expect(min.value).toBe("1 m");
+    expect(tip(min)).toBe(reason);
+    // Undo back to auto: empty, the placeholder shown, no mark.
+    rerender(<NestingSection {...p} nesting={at93({})} />);
+    expect(min.value).toBe("");
+    expect(marked(min)).toBe("");
+    expect(tip(min)).toMatch(TIP);
+    expect(p.onSettings).not.toHaveBeenCalled();
   });
 
   it("#49: a glued part lists its glue-up, each strip at its own width, and the model lights every strip", () => {
@@ -231,6 +917,18 @@ describe("Stock dialog", () => {
     expect(p.onReset).toHaveBeenCalled();
   });
 
+  it("#58: Built-in stock's tooltip says what it puts back in the document's units", () => {
+    const title = (over: Partial<StockDialogProps>) => {
+      const { unmount } = render(<StockDialog {...dprops(over)} />);
+      const t = screen.getByRole("button", { name: "Built-in stock" }).getAttribute("title");
+      unmount();
+      return t;
+    };
+    expect(title({})).toBe("Back to the built-in sheets and boards: kerf 1/8 in, no trim, joint loss 1/8 in, minimum strip auto, table saw");
+    expect(title({ rounding: "half_mm", units: "mm" })).toBe("Back to the built-in sheets and boards: kerf 3.18 mm, no trim, joint loss 3.18 mm, minimum strip auto, table saw");
+    expect(title({ rounding: { r: "sixteenth", style: "decimal" }, units: "in" })).toBe("Back to the built-in sheets and boards: kerf 0.125 in, no trim, joint loss 0.125 in, minimum strip auto, table saw");
+  });
+
   it("fills the actual thickness from the nominal until it is typed (lane 15)", () => {
     const p = dprops();
     render(<StockDialog {...p} />);
@@ -319,5 +1017,127 @@ describe("Cut list pane with nesting", () => {
     rerender(<CutListPane {...cprops({ onNest, nestOpen: true, nesting: <NestingSection {...props()} /> })} />);
     expect(screen.getByRole("button", { name: "Nesting ‹" }).getAttribute("aria-pressed")).toBe("true");
     expect(screen.getByTestId("nesting")).toBeTruthy();
+  });
+
+  it("#56: a glued row says what it is glued from while the nesting is there, and reads as before without it", () => {
+    // The bookshelf's shelves (row 1), all four glued from the 12 in board.
+    const list = bookshelf();
+    const nodes = [3, 4, 5, 6];
+    list.rows[1].occurrences = nodes.map((node) => ({ item: { node }, visible: true, handed: false }) as never);
+    const n = smallNesting();
+    n.glue_ups = nodes.map((node, k) => ({ row: 1, copy: k + 1, tag: `2${"abcd"[k]}`, name: "Shelf", item: { node }, stock: "4/4 x 12 x 96", widths: [12 * IN, 3.125 * IN] }));
+    const notes = () => screen.getByRole("row", { name: /^Shelf/ }).querySelector("td.part")!.textContent;
+    const { rerender } = render(<CutListPane {...cprops({ list, nestOpen: true, nested: n })} />);
+    expect(notes()).toContain("glued from 2 (4/4 x 12 x 96)");
+    // The other rows have no such note.
+    expect(screen.getByRole("row", { name: /^Side/ }).textContent).not.toContain("glued");
+    // Without the nesting (its section closed), the row reads as before.
+    rerender(<CutListPane {...cprops({ list, nestOpen: false, nested: null })} />);
+    expect(notes()).not.toContain("glued");
+  });
+
+  it("#56: a board's caption and label count a glued part once, with its strips", () => {
+    render(<NestingSection {...props({ nesting: gluedNesting() })} />);
+    const fig = screen.getAllByRole("figure")[0];
+    expect(fig.querySelector("summary")!.textContent).toContain("4 cuts, 2 parts in 3 pieces");
+    expect(within(fig).getByRole("img").getAttribute("aria-label")).toContain(": 2 parts in 3 pieces, ");
+    // The sheet, with no strips, reads as before.
+    expect(screen.getAllByRole("figure")[1].querySelector("summary")!.textContent).toContain("2 cuts, 1 part");
+  });
+});
+
+// #100: the settings stored now (`stored`, from the state the app reads after every change,
+// Undo and Redo included) are what a change is laid over and what a typed length is compared
+// with, not the last nesting worked out (`nesting.settings`), which lags 200 ms behind.
+describe("Nesting settings after Undo or Redo (#100)", () => {
+  const MM = 0.001;
+  // What a length typed in millimetres is read as, to the bit.
+  const typed = (t: string) => {
+    const r = parseLength(t, "mm");
+    if (!r.ok) throw new Error(r.error);
+    return r.metres;
+  };
+  // The pane's last nesting: kerf and trim 3.1 mm. Undo has since put trim back to 0.
+  const lagging = () => {
+    const n = smallNesting();
+    return { ...n, settings: { ...n.settings, kerf: 3.1 * MM, trim: 3.1 * MM } };
+  };
+  const mm = (over: Partial<NestingSectionProps>) => props({ units: "mm", rounding: "half_mm", nesting: lagging(), ...over });
+
+  it("a change to one setting keeps the others as stored now, not as last nested", () => {
+    const p = mm({ stored: { kerf: 3.1 * MM, trim: 0, algorithm: "guillotine" } });
+    render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    fireEvent.change(kerf, { target: { value: "3.15" } });
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenCalledTimes(1);
+    expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: typed("3.15"), trim: 0, algorithm: "guillotine" });
+  });
+
+  it("the fields show the stored settings at once, before the nesting catches up", () => {
+    render(<NestingSection {...mm({ stored: { kerf: IN / 8, trim: 0, algorithm: "maxrects", jointLoss: 2 * MM, minStrip: 30 * MM } })} />);
+    expect((screen.getByLabelText("Kerf") as HTMLInputElement).value).toBe("3.18 mm");
+    expect((screen.getByLabelText("Trim") as HTMLInputElement).value).toBe("0 mm");
+    expect((screen.getByLabelText("Joint loss") as HTMLInputElement).value).toBe("2 mm");
+    expect((screen.getByLabelText("Minimum strip") as HTMLInputElement).value).toBe("30 mm");
+    expect((screen.getByLabelText("Nesting algorithm") as HTMLSelectElement).value).toBe("maxrects");
+  });
+
+  it("a typed length is compared with the stored value: Enter after Undo stores it", () => {
+    // Kerf 3.1 mm was set, then Undo put the 1/8 in kerf back; the nesting still says 3.1.
+    const p = mm({ stored: { kerf: IN / 8, trim: 3.1 * MM, algorithm: "guillotine" } });
+    render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    fireEvent.change(kerf, { target: { value: "3.1" } });
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenCalledTimes(1);
+    expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: typed("3.1"), trim: 3.1 * MM, algorithm: "guillotine" });
+  });
+
+  it("the saw, the joint loss and clearing the minimum strip keep the stored settings too", () => {
+    const stored = { kerf: IN / 8, trim: 0, algorithm: "guillotine" as const, minStrip: 30 * MM };
+    const p = mm({ stored });
+    render(<NestingSection {...p} />);
+    fireEvent.change(screen.getByLabelText("Nesting algorithm"), { target: { value: "maxrects" } });
+    expect(p.onSettings).toHaveBeenLastCalledWith({ ...stored, algorithm: "maxrects" });
+    const joint = screen.getByLabelText("Joint loss") as HTMLInputElement;
+    fireEvent.change(joint, { target: { value: "2" } });
+    fireEvent.keyDown(joint, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenLastCalledWith({ ...stored, jointLoss: typed("2") });
+    const min = screen.getByLabelText("Minimum strip") as HTMLInputElement;
+    fireEvent.change(min, { target: { value: "" } });
+    fireEvent.keyDown(min, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: IN / 8, trim: 0, algorithm: "guillotine" });
+    expect(p.onSettings).toHaveBeenCalledTimes(3);
+  });
+
+  it("the controls still wait for a first nesting, stored settings or not", () => {
+    render(<NestingSection {...mm({ nesting: null, stored: { kerf: IN / 8, trim: 0, algorithm: "guillotine" } })} />);
+    expect(screen.queryByLabelText("Kerf")).toBeNull();
+    expect(screen.queryByLabelText("Nesting algorithm")).toBeNull();
+    expect(screen.getByText("Nesting the parts…")).toBeTruthy();
+  });
+
+  it("while the nesting is worked out again, the footer naming its settings is dimmed with the diagrams", () => {
+    const { rerender } = render(<NestingSection {...mm({ stored: { kerf: 3.1 * MM, trim: 0, algorithm: "guillotine" }, busy: true })} />);
+    const note = screen.getByTestId("nest-note");
+    // The fields show the settings stored now; the footer still names the nesting drawn.
+    expect((screen.getByLabelText("Trim") as HTMLInputElement).value).toBe("0 mm");
+    expect(note.textContent).toContain("trim 3.1 mm per edge");
+    expect(note.className).toBe("note nest-note busy");
+    expect(note.getAttribute("aria-busy")).toBe("true");
+    rerender(<NestingSection {...mm({ stored: { kerf: 3.1 * MM, trim: 0, algorithm: "guillotine" }, busy: false })} />);
+    expect(note.className).toBe("note nest-note");
+    expect(note.getAttribute("aria-busy")).toBe("false");
+  });
+
+  it("with no stored settings (an older caller), the last nesting's are used as before", () => {
+    const p = mm({});
+    render(<NestingSection {...p} />);
+    const kerf = screen.getByLabelText("Kerf") as HTMLInputElement;
+    expect(kerf.value).toBe("3.1 mm");
+    fireEvent.change(kerf, { target: { value: "3.15" } });
+    fireEvent.keyDown(kerf, { key: "Enter" });
+    expect(p.onSettings).toHaveBeenLastCalledWith({ kerf: typed("3.15"), trim: 3.1 * MM, algorithm: "guillotine" });
   });
 });

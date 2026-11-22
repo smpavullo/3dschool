@@ -8,7 +8,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { NestAlgorithm, Nesting, NestSettings, Placement, StockPiece } from "../kernel/types";
 import { parseLength, type UnitSystem } from "../lib/units";
 import { diagram } from "../nesting/diagram";
-import { ALGORITHMS, cutText, dims, fineU, glueText, JOINT_LOSS_DEFAULT, type Units, nestNote, nestSummary, pieceNumber, pieceYield, placedSize, reasonText, stripText } from "../nesting/format";
+import { ALGORITHMS, cutText, dims, fineU, glueText, JOINT_LOSS_DEFAULT, type Units, nestNote, nestSummary, pieceCount, pieceNumber, pieceYield, placedSize, reasonText, stripText } from "../nesting/format";
 
 export interface NestingSectionProps {
   nesting: Nesting | null;
@@ -19,6 +19,10 @@ export interface NestingSectionProps {
   rounding: Units;
   /** How typed kerf and trim are read (a bare number is in these units). */
   units: UnitSystem;
+  /** #100: the settings stored now (the app's state after every change, Undo and Redo
+   * included). The fields show these and a change is laid over them; `nesting.settings` is
+   * the last nesting worked out, 200 ms behind. Absent: the nesting's are used. */
+  stored?: NestSettings | null;
   onSettings: (s: NestSettings) => void;
   onStock: () => void;
   /** The pointer is over a part's rectangle (null: over none). */
@@ -32,57 +36,133 @@ export interface NestingSectionProps {
   lit?: string | null;
 }
 
-/** Kerf or trim typed in a field: committed on Enter, on leaving the field, or after a pause. */
-function LengthField({ label, value, units, rounding, max, onCommit }: { label: string; value: number; units: UnitSystem; rounding: Units; max: number; onCommit: (m: number) => void }) {
-  const shown = fineU(value, rounding);
+/**
+ * Kerf or trim typed in a field: committed on Enter, on leaving the field, or after a pause.
+ * #57: with `onClear` the field may be empty (`value` null, `placeholder` shown), and
+ * clearing it calls `onClear`.
+ */
+function LengthField({
+  label,
+  value,
+  units,
+  rounding,
+  max,
+  onCommit,
+  onClear,
+  placeholder,
+  hint,
+}: {
+  label: string;
+  value: number | null;
+  units: UnitSystem;
+  rounding: Units;
+  max: number;
+  onCommit: (m: number) => void;
+  onClear?: () => void;
+  placeholder?: string;
+  /** What the field's tip says before "(type a length: …)". */
+  hint?: string;
+}) {
+  const shown = value === null ? "" : fineU(value, rounding);
   const [text, setText] = useState(shown);
   const [err, setErr] = useState<string | null>(null);
-  useEffect(() => setText(shown), [shown]);
+  // #98: while the person is typing in the focused field, a new reading of the stored value
+  // (the pause's own commit, a nesting refresh, Undo) does not replace their text. It waits
+  // for Enter, leaving the field or Escape, which end the typing.
+  const typing = useRef(false);
+  const input = useRef<HTMLInputElement>(null);
+  const before = useRef(shown);
+  useEffect(() => {
+    const was = before.current;
+    before.current = shown;
+    // Still being typed: a key since the last commit, the field still focused (focus can go
+    // without a blur event reaching it), and text other than the reading it was typed over.
+    // Otherwise nothing of the person's is lost, and the field follows the stored value.
+    if (typing.current && document.activeElement === input.current && text !== was) return;
+    typing.current = false;
+    setText(shown);
+    // #101: the field now shows the reading, so an error that belonged to the text before
+    // goes with it. A refused length still being typed returned above, mark and all.
+    setErr(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shown]);
   // Lane 30 (from the #33 review): a commit reads the value and the settings as they are
   // now, not as they were when the pause timer was set. The timer used to keep its render's:
   // Enter, then the pause, committed the same length twice, and a change from outside while
   // a typed length waited (a plugin, Redo) was undone in the other field when it fired.
-  const now = useRef({ value, shown, units, rounding, max, label, onCommit });
-  now.current = { value, shown, units, rounding, max, label, onCommit };
+  const now = useRef({ value, shown, units, rounding, max, label, onCommit, onClear });
+  now.current = { value, shown, units, rounding, max, label, onCommit, onClear };
   const timer = useRef<number | null>(null);
   const stopTimer = () => {
     if (timer.current !== null) window.clearTimeout(timer.current);
     timer.current = null;
   };
-  const commit = (t: string) => {
+  const commit = (t: string, paused = false) => {
     // Enter or leaving the field commits now; the pause has nothing left to do.
     stopTimer();
     const c = now.current;
-    if (t.trim() === c.shown) return setErr(null);
+    // #98: Enter ends the typing once the length is taken. A refused one is still the
+    // person's text, kept with its reason; leaving the field ends the typing (onBlur).
+    const taken = () => {
+      if (!paused) typing.current = false;
+    };
+    if (t.trim() === c.shown) {
+      taken();
+      return setErr(null);
+    }
+    if (c.onClear && t.trim() === "") {
+      taken();
+      setErr(null);
+      if (c.value !== null) c.onClear();
+      return;
+    }
     const r = parseLength(t, c.units);
     if (!r.ok) return setErr(r.error);
     if (r.metres < 0 || r.metres > c.max) return setErr(`${c.label}: 0 to ${fineU(c.max, c.rounding)}.`);
+    taken();
     setErr(null);
-    if (Math.abs(r.metres - c.value) > 1e-9) c.onCommit(r.metres);
+    if (c.value === null || Math.abs(r.metres - c.value) > 1e-9) c.onCommit(r.metres);
+    // #93: a commit reads the same when a typed length rounds to the text already shown.
+    // `shown` does not change, so the effect below does not reset the field; do it here so
+    // the unit the value is displayed with comes back after Enter or leaving the field.
+    // Only then: a length that reads differently keeps the typed text until the new value
+    // arrives (the effect shows it), instead of the old reading in between. And not on the
+    // pause, which would swap the text under the caret while nothing visible has changed.
+    if (!paused && fineU(r.metres, c.rounding) === c.shown) setText(c.shown);
   };
-  // A short pause after typing re-nests too.
+  // A short pause after typing re-nests too. #57: not an emptied optional field, which is
+  // more often on its way to another length than cleared; Enter or leaving it clears it.
   useEffect(() => {
-    if (text === shown) return;
+    if (text === shown || (onClear && text.trim() === "")) return;
     timer.current = window.setTimeout(() => {
       timer.current = null;
-      commit(text);
+      commit(text, true);
     }, 700);
     return stopTimer;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text]);
   return (
-    <label className={err ? "err" : undefined} title={err ?? `${label} (type a length: 1/8, 3/32, 3mm)`}>
+    <label className={err ? "err" : undefined} title={err ?? `${hint ?? label} (type a length: 1/8, 3/32, 3mm)`}>
       <span>{label}</span>
       <input
+        ref={input}
         aria-label={label}
         value={text}
+        placeholder={placeholder}
         size={5}
-        onChange={(e) => setText(e.currentTarget.value)}
-        onBlur={(e) => commit(e.currentTarget.value)}
+        onChange={(e) => {
+          typing.current = document.activeElement === e.currentTarget;
+          setText(e.currentTarget.value);
+        }}
+        onBlur={(e) => {
+          typing.current = false;
+          commit(e.currentTarget.value);
+        }}
         onKeyDown={(e) => {
           e.stopPropagation();
           if (e.key === "Enter") commit(e.currentTarget.value);
           if (e.key === "Escape") {
+            typing.current = false;
             setText(shown);
             setErr(null);
           }
@@ -95,6 +175,9 @@ function LengthField({ label, value, units, rounding, max, onCommit }: { label: 
 const KERF_MAX = 0.5 * 0.0254;
 const TRIM_MAX = 4 * 0.0254;
 const JOINT_LOSS_MAX = 0.5 * 0.0254;
+// 12 in as 0.3048 m, as the kernel has it: 12 * 0.0254 rounds a hair under, so 304.8 mm
+// and 1' would be refused.
+const MIN_STRIP_MAX = 0.3048;
 
 function PieceDiagram({ piece, rounding, lit, onHover, onSelect }: { piece: StockPiece; rounding: Units; lit?: string | null; onHover: (p: Placement | null) => void; onSelect: (p: Placement) => void }) {
   const d = useMemo(() => diagram(piece), [piece]);
@@ -108,7 +191,7 @@ function PieceDiagram({ piece, rounding, lit, onHover, onSelect }: { piece: Stoc
       className="nest-diagram"
       viewBox={`0 0 ${d.width * S} ${d.height * S}`}
       role="img"
-      aria-label={`${pieceNumber(piece)}: ${piece.placements.length} part${piece.placements.length === 1 ? "" : "s"}, ${pieceYield(piece, rounding)}`}
+      aria-label={`${pieceNumber(piece)}: ${pieceCount(piece)}, ${pieceYield(piece, rounding)}`}
       onMouseLeave={() => {
         setOver(null);
         onHover(null);
@@ -152,7 +235,8 @@ export function NestingSection(p: NestingSectionProps) {
   const n = p.nesting;
   const r = p.rounding;
   const s = n ? nestSummary(n, r) : null;
-  const settings = n?.settings;
+  // #100: shown, and changed, as stored now; the controls still wait for a first nesting.
+  const settings = n ? (p.stored ?? n.settings) : undefined;
   const set = (patch: Partial<NestSettings>) => settings && p.onSettings({ ...settings, ...patch });
   return (
     <section className="nesting" aria-label="Nesting" data-testid="nesting">
@@ -177,6 +261,21 @@ export function NestingSection(p: NestingSectionProps) {
           <LengthField label="Kerf" value={settings.kerf} units={p.units} rounding={r} max={KERF_MAX} onCommit={(kerf) => set({ kerf })} />
           <LengthField label="Trim" value={settings.trim} units={p.units} rounding={r} max={TRIM_MAX} onCommit={(trim) => set({ trim })} />
           <LengthField label="Joint loss" value={settings.jointLoss ?? JOINT_LOSS_DEFAULT} units={p.units} rounding={r} max={JOINT_LOSS_MAX} onCommit={(jointLoss) => set({ jointLoss })} />
+          <LengthField
+            label="Minimum strip"
+            value={settings.minStrip ?? null}
+            units={p.units}
+            rounding={r}
+            max={MIN_STRIP_MAX}
+            placeholder="auto"
+            hint="Minimum strip: a glue-up's last strip narrower than this is evened out with the one before it, never past half the board. Empty: 1 1/2 in, or a quarter of the board if less"
+            onCommit={(minStrip) => set({ minStrip })}
+            onClear={() => {
+              if (!settings) return;
+              const { minStrip: _gone, ...rest } = settings;
+              p.onSettings(rest);
+            }}
+          />
         </div>
       ) : null}
       {p.problem ? <p className="note err">{p.problem}</p> : null}
@@ -238,7 +337,7 @@ export function NestingSection(p: NestingSectionProps) {
               <PieceDiagram piece={piece} rounding={r} lit={p.lit} onHover={p.onHover} onSelect={p.onSelect} />
               <details>
                 <summary>
-                  {piece.cuts.length} cut{piece.cuts.length === 1 ? "" : "s"}, {piece.placements.length} part{piece.placements.length === 1 ? "" : "s"}
+                  {piece.cuts.length} cut{piece.cuts.length === 1 ? "" : "s"}, {pieceCount(piece)}
                   {p.onSvg ? (
                     <button
                       type="button"
@@ -291,7 +390,10 @@ export function NestingSection(p: NestingSectionProps) {
         </div>
       ) : null}
       {n ? (
-        <p className="note" data-testid="nest-note">
+        // #100: the footer names the settings of the nesting drawn. While it is worked out
+        // again it is dimmed with the diagrams, since the fields above already show the
+        // settings stored now (Undo and Redo change them before the nesting catches up).
+        <p className={p.busy ? "note nest-note busy" : "note nest-note"} data-testid="nest-note" aria-busy={p.busy}>
           {nestNote(n, r)}
         </p>
       ) : null}

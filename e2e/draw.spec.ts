@@ -102,6 +102,30 @@ test("Rect drawn square on the ground in the iso view stays a square, not a line
   await expect(page.locator("#hint")).toContainText("Rectangle 12 × 12 in on the ground");
 });
 
+test("A second rect started level with a corner the cursor rested on stays on the ground, not up blue through that corner (#9)", async ({ page }) => {
+  const vp = await ready(page);
+  await page.getByRole("button", { name: "Iso", exact: true }).click();
+  await expect(vp).toHaveAttribute("data-view", "iso");
+  // A 16 x 10 in rectangle from the origin; rest on its corner at (16, 10) in.
+  await page.keyboard.press("r");
+  await page.keyboard.type("16,10");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#hint")).toContainText("Rectangle 16 × 10 in on the ground");
+  const [cx, cy] = await at(page, [16 * IN, 10 * IN, 0]);
+  await page.mouse.move(cx, cy, { steps: 2 });
+  await expect(vp).toHaveAttribute("data-inference", "endpoint");
+  // The second rectangle's first corner at x = 16 in, in front of the first: taken on the
+  // green line through the corner rested on (a from point, about 6 in in front).
+  await click(page, [16 * IN, -6 * IN, 0]);
+  await expect(page.locator("#hint")).toContainText("First corner set on the ground");
+  // The far corner taken 2 px beside the blue line through the corner rested on, 8 in up:
+  // that line lifted it, and the plane x = 16 in through the first corner held it.
+  const [x, y] = await at(page, [16 * IN, 10 * IN, 8 * IN], 2, 0);
+  await page.mouse.move(x, y, { steps: 4 });
+  await page.mouse.click(x, y);
+  await expect(page.locator("#hint")).toContainText(/Rectangle .* in on the ground/);
+});
+
 test("Rotated rectangle, circle and polygon with typed counts, arc with a typed radius", async ({ page }) => {
   const vp = await ready(page);
   await page.getByRole("button", { name: "Top", exact: true }).click();
@@ -170,4 +194,27 @@ test("a line across a solid's face from edge to edge splits it; a dangling line 
   await expect(page.locator("#hint")).toContainText("Cut on face 2 of solid 1");
   await expect(vp).toHaveAttribute("data-parts", "7");
   await expect(vp).toHaveAttribute("data-watertight", "true");
+});
+
+test("Undo drops a line half drawn: a length typed then draws nothing from where the undone line ended", async ({ page }) => {
+  const vp = await ready(page);
+  await page.getByRole("button", { name: "Top", exact: true }).click();
+  await page.keyboard.press("l");
+  await click(page, [0, 0, 0]);
+  await click(page, [12 * IN, 0, 0]);
+  const hint = page.locator("#hint");
+  await expect(hint).toContainText("Line 12 in");
+  // The chain waits at the line's far end for the next point. Undo takes the line away, and
+  // the chain with it.
+  await page.keyboard.press("Control+z");
+  await expect(hint).toContainText("Undone");
+  const hash = await vp.getAttribute("data-hash");
+  const [x, y] = await at(page, [12 * IN, 8 * IN, 0]);
+  await page.mouse.move(x, y, { steps: 2 });
+  await page.keyboard.type("6");
+  await page.keyboard.press("Enter");
+  // Without the app resetting the tool, the chain outlived the Undo and this drew a 6 in line
+  // up from (12, 0, 0), where nothing is any more.
+  await expect(hint).toContainText("Click where the line starts");
+  await expect(vp).toHaveAttribute("data-hash", hash!);
 });
